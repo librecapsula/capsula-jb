@@ -5,8 +5,8 @@
 
 use jb_core::config::Config;
 use jb_core::progress::Progress;
-use jb_rockchip::session::{bring_up, BringUpError, Bus};
-use rockusb::loader::{opcode, LoaderSession};
+use jb_rockchip::session::{BringUpError, Bus, Goal, bring_up};
+use rockusb::loader::{LoaderSession, opcode};
 use rockusb::mock::{MockTransport, Step};
 use rockusb::{DeviceMode, LoaderContainer};
 use std::collections::VecDeque;
@@ -71,7 +71,7 @@ fn synth_loader() -> LoaderContainer {
     buf[25] = 1; // n471
     buf[31] = 1; // n472
     buf[44] = 1; // rc4_flag != 0 -> RC4 off
-                 // entry 0: DDR init (0x471)
+    // entry 0: DDR init (0x471)
     buf[HEADER_SIZE + 1..HEADER_SIZE + 5].copy_from_slice(&1u32.to_le_bytes());
     buf[HEADER_SIZE + 45..HEADER_SIZE + 49].copy_from_slice(&(DATA_OFF as u32).to_le_bytes());
     buf[HEADER_SIZE + 49..HEADER_SIZE + 53].copy_from_slice(&(ddra.len() as u32).to_le_bytes());
@@ -268,17 +268,22 @@ impl Bus for FakeBus {
 
 fn run(
     bus: &mut FakeBus,
-    no_backup: bool,
+    stock_loader_goal: bool,
 ) -> Result<jb_rockchip::session::BroughtUp<MockTransport>, BringUpError> {
     let config = Config::embedded();
     let loader = synth_loader();
     let progress = |_: Progress| {};
+    let goal = if stock_loader_goal {
+        Goal::StockLoader
+    } else {
+        Goal::UsbPlug
+    };
     bring_up(
         bus,
         &config,
         &loader,
         Some(Duration::from_secs(30)),
-        no_backup,
+        goal,
         &progress,
     )
 }

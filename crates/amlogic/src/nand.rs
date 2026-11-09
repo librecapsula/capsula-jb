@@ -1,7 +1,7 @@
 //! A113X NAND geometry and the streaming read path (the only one).
 
 use crate::transport::Transport;
-use crate::{AmlogicSession, Error, Result, RAM_SCRATCH};
+use crate::{AmlogicSession, Error, RAM_SCRATCH, Result};
 use std::io::Write;
 
 pub const NAND_SIZE: u32 = 0x1000_0000;

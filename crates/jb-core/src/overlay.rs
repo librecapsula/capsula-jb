@@ -29,25 +29,28 @@ pub struct OverlayFile {
     pub mode: u32,
 }
 
-/// The overlay file set: adbd + the gadget flag + the jailbreak marker.
+/// The overlay file set: adbd (unless `adbd` is false — then only the
+/// gadget flag and the marker are written) + the jailbreak marker.
 /// After boot they appear as /usr/bin/adbd, /etc/init.d/.usb_config and
 /// /etc/jailbreak.
-pub fn overlay_files(marker: String) -> Vec<OverlayFile> {
-    vec![
-        OverlayFile {
+pub fn overlay_files(marker: String, adbd: bool) -> Vec<OverlayFile> {
+    let mut files = Vec::with_capacity(3);
+    if adbd {
+        files.push(OverlayFile {
             path: format!("{UPPER_DIR}/usr/bin/adbd"),
             data: OVERLAY_ADBD.to_vec(),
             mode: 0o755,
-        },
-        OverlayFile {
-            path: format!("{UPPER_DIR}/etc/init.d/.usb_config"),
-            data: OVERLAY_USB_CONFIG.to_vec(),
-            mode: 0o644,
-        },
-        OverlayFile {
-            path: format!("{UPPER_DIR}/etc/jailbreak"),
-            data: marker.into_bytes(),
-            mode: 0o644,
-        },
-    ]
+        });
+    }
+    files.push(OverlayFile {
+        path: format!("{UPPER_DIR}/etc/init.d/.usb_config"),
+        data: OVERLAY_USB_CONFIG.to_vec(),
+        mode: 0o644,
+    });
+    files.push(OverlayFile {
+        path: format!("{UPPER_DIR}/etc/jailbreak"),
+        data: marker.into_bytes(),
+        mode: 0o644,
+    });
+    files
 }

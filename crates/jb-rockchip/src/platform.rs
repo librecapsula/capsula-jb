@@ -11,16 +11,18 @@
 //! the session rebinds the node and the bring-up — a re-entrant state
 //! machine over the current bus state — is retried.
 
+use anyhow::{Context, Result, anyhow, bail};
 use jb_core::backend::Backend;
+use jb_core::backup_catalog::{self as catalog, BackupManifest};
 use jb_core::backup_store::BackupStore;
 use jb_core::config::Config;
 use jb_core::format::humansize;
 use jb_core::overlay::OverlayFile;
 use jb_core::progress::ProgressFn;
-use jb_core::scenario::{self, Params, Platform, Prepared};
-use anyhow::{anyhow, bail, Context, Result};
-use rockusb::loader::RESET_SUBCODE_NORMAL;
+use jb_core::scenario::{BackupState, Platform, Prepared, RestoreItem};
+use jb_core::session::{Identity, Model};
 use rockusb::NusbTransport;
+use rockusb::loader::RESET_SUBCODE_NORMAL;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,11 +30,14 @@ use std::time::Duration;
 /// the stock firmware blinks 0006 for under a second.
 const GADGET_STABLE: Duration = Duration::from_secs(10);
 
-/// The live device as the flow sees it (after bring-up). The `firstgen`
+/// The live device as the flow sees it (after connect). The `firstgen`
 /// flag selects the path inside the shared flow: first generation and
 /// --no-backup runs work over the stock loader (330d); on first
 /// generation the backup is NOT intact (0xCC above the 32 MiB read
-/// mask) and userdata is always built from scratch.
+/// mask) and userdata is always built from scratch. `usbplug` tracks
+/// which persona the session is: connect stays on the stock loader
+/// (identity is all it needs), the dump switches a regular column to
+/// our usbplug on demand.
 struct Device {
     session: rockusb::LoaderSession<NusbTransport>,
     serial: String,
@@ -40,6 +45,9 @@ struct Device {
     /// gift serial — the dump above the 32 MiB read mask is 0xCC,
     /// userdata is built from scratch.
     firstgen: bool,
+    /// The session is our usbplug in RAM (readable above the stock
+    /// mask) — as opposed to the stock loader persona.
+    usbplug: bool,
     /// A fresh backup was taken this run (false = a verified backup for
     /// this serial already existed, or --no-backup).
     dumped: bool,
@@ -95,40 +103,10 @@ impl Backend for Rockchip {
         Some(&self.config.hint.text)
     }
 
-    fn jailbreak(
-        &mut self,
-        params: &Params,
-        confirm: jb_core::scenario::Confirm,
-        progress: ProgressFn,
-    ) -> Result<()> {
-        scenario::jailbreak(self, params, confirm, progress)
-    }
-
-    fn backup(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<()> {
-        scenario::backup(self, wait, progress)
-    }
-
-    fn restore(
-        &mut self,
-        wait: Option<Duration>,
-        confirm: jb_core::scenario::Confirm,
-        progress: ProgressFn,
-    ) -> Result<()> {
-        scenario::restore(self, wait, confirm, progress)
-    }
-}
-
-impl Platform for Rockchip {
-    fn prepare(
-        &mut self,
-        no_backup: bool,
-        wait: Option<Duration>,
-        progress: ProgressFn,
-    ) -> Result<Prepared> {
+    fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
         self.wait = wait;
         self.gpt = None;
-        let dev = self.dump_all(wait, no_backup, progress)?;
-        let dir = backup_dir(&dev.serial);
+        let dev = self.connect_device(wait, progress)?;
         if dev.firstgen {
             log::info!(
                 "первое поколение {} (стоковый лоадер): бэкап нецелостный \
@@ -136,24 +114,108 @@ impl Platform for Rockchip {
                 dev.serial
             );
         }
-        let complete = !dev.firstgen;
-        let dumped = dev.dumped;
-        // The base of the new userdata image: the verified dump of this
-        // column (regular path), or nothing when building from scratch.
-        // Re-opens and re-verifies the backup so a broken dump never
-        // becomes the base of the only copy.
-        let base = if no_backup || dev.firstgen {
-            None
-        } else {
-            image_base(&dir)?
+        let identity = Identity {
+            model: Model::Capsule,
+            key: dev.serial.clone(),
+            firstgen: dev.firstgen,
+            caveats: if dev.firstgen {
+                vec![
+                    "полный бэкап невозможен (BootROM залочен): дамп нецелостный, 0xCC выше 32 МиБ"
+                        .into(),
+                ]
+            } else {
+                vec![]
+            },
         };
         self.device = Some(dev);
+        Ok(identity)
+    }
+
+    fn platform(&mut self) -> &mut dyn Platform {
+        self
+    }
+}
+
+impl Platform for Rockchip {
+    fn ensure_backup(&mut self, no_backup: bool, progress: ProgressFn) -> Result<Prepared> {
+        let (serial, firstgen) = self
+            .device
+            .as_ref()
+            .map(|d| (d.serial.clone(), d.firstgen))
+            .ok_or_else(|| anyhow!("устройство не подключено"))?;
+        let dir = backup_dir(&serial);
+        if no_backup {
+            log::info!(
+                "--no-backup: бэкап не проверяю и не снимаю — userdata будет \
+                 собран с нуля, текущее содержимое теряется"
+            );
+            return Ok(Prepared {
+                base: None,
+                dumped: false,
+                dir: None,
+                complete: !firstgen,
+            });
+        }
+        // A verified backup of THIS column exists -> skip the dump and
+        // go straight to the userdata write. The full checksum pass
+        // happens right here, so a broken dump never serves as the
+        // base of the only copy.
+        if let Some(entry) = catalog::read(&dir) {
+            match entry.verify() {
+                Ok(()) => {
+                    log::info!(
+                        "бэкап уже есть в {} — дамп пропускаю (удалите каталог, \
+                         чтобы снять заново)",
+                        dir.display()
+                    );
+                    return Ok(Prepared {
+                        base: if firstgen { None } else { image_base(&dir)? },
+                        dumped: false,
+                        dir: Some(dir),
+                        complete: !firstgen,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("бэкап не прошёл проверку ({e}) — снимаю заново");
+                }
+            }
+        }
+        let report = self.dump_with_retries(&dir, progress)?;
+        self.seal_backup(&dir, &report)?;
+        // The base of the new userdata image: the verified dump of this
+        // column (regular path), or nothing when building from scratch.
+        // Re-verifies the freshly sealed backup — the same gate as for
+        // a reused capture.
+        let base = if firstgen { None } else { image_base(&dir)? };
         Ok(Prepared {
             base,
-            dumped,
-            dir: if no_backup { None } else { Some(dir) },
-            complete,
+            dumped: true,
+            dir: Some(dir),
+            complete: !firstgen,
         })
+    }
+
+    fn backup_state(&self) -> BackupState {
+        let Some(dev) = &self.device else {
+            return BackupState::None;
+        };
+        let dir = backup_dir(&dev.serial);
+        // Manifest metadata only — the checksum pass runs in
+        // ensure_backup before a capture becomes the base.
+        match catalog::read(&dir) {
+            Some(e) if e.manifest.status == catalog::Status::Complete => {
+                BackupState::Verified { dir }
+            }
+            Some(e) => BackupState::Unusable {
+                dir,
+                why: if e.manifest.notes.is_empty() {
+                    vec!["бэкап снят с оговорками".into()]
+                } else {
+                    e.manifest.notes.clone()
+                },
+            },
+            None => BackupState::None,
+        }
     }
 
     fn data_size(&mut self, progress: ProgressFn) -> Result<u64> {
@@ -193,16 +255,16 @@ impl Platform for Rockchip {
              текущее содержимое теряется)"
                 .into()
         } else if fresh {
-            "оверлей adbd на чистый ext2 (--format-userdata, содержимое теряется)"
-                .into()
+            "оверлей adbd на чистый ext2 (--format-userdata, содержимое теряется)".into()
         } else {
             "оверлей adbd поверх дампа, содержимое сохраняется".into()
         }
     }
 
     fn describe_restore(&self) -> String {
-        "userdata из верифицированного дампа — оверлей джейлбрейка и всё, \
-         что записано после дампа, будет затёрто".into()
+        "все целые разделы из верифицированного дампа + GPT и idblock — \
+         оверлей джейлбрейка и всё, что записано после дампа, будет затёрто"
+            .into()
     }
 
     fn build_data_image(
@@ -235,6 +297,91 @@ impl Platform for Rockchip {
             .ok_or_else(|| anyhow!("GPT не прочитан"))?;
         crate::flash::write_partition_padded(&mut dev.session, gpt, "userdata", image, progress)
             .with_context(|| format!("колонка {}: запись userdata", dev.serial))
+    }
+
+    fn restore_set(&mut self) -> Result<(Vec<RestoreItem>, Vec<String>)> {
+        let dev = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow!("устройство не поднято"))?;
+        let dir = backup_dir(&dev.serial);
+        let entry = catalog::read(&dir).ok_or_else(|| {
+            anyhow!(
+                "восстановление невозможно: нет верифицированного захвата {} \
+                 для этой колонки; сначала снимите его — capsula-jb backup",
+                dev.serial
+            )
+        })?;
+        entry
+            .verify()
+            .context("бэкап не прошёл проверку SHA256 — снимите дамп заново")?;
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        for img in &entry.manifest.images {
+            if img.complete {
+                items.push(RestoreItem {
+                    partition: img.partition.clone(),
+                    image: dir.join(&img.file),
+                    size: img.size,
+                });
+            } else {
+                skipped.push(img.partition.clone());
+            }
+        }
+        Ok((items, skipped))
+    }
+
+    fn write_restore(&mut self, items: &[RestoreItem], progress: ProgressFn) -> Result<()> {
+        // The LIVE table places the partitions (an image that no longer
+        // fits — bad blocks grew the map — is an error, see the size
+        // check in write_partition_padded); the GPT itself and the
+        // idblock go LAST, restoring the table over itself is a no-op
+        // when the maps are equal.
+        if self.gpt.is_none() {
+            let dev = self
+                .device
+                .as_mut()
+                .ok_or_else(|| anyhow!("устройство не поднято"))?;
+            let (gpt, _) = crate::session::read_gpt(&mut dev.session, progress)
+                .context("не удалось прочитать GPT колонки")?;
+            self.gpt = Some(gpt);
+        }
+        let serial = self
+            .device
+            .as_ref()
+            .map(|d| d.serial.clone())
+            .ok_or_else(|| anyhow!("устройство не поднято"))?;
+        for item in items {
+            let dev = self
+                .device
+                .as_mut()
+                .ok_or_else(|| anyhow!("устройство не поднято"))?;
+            let gpt = self.gpt.as_ref().expect("прочитан выше");
+            crate::flash::write_partition_padded(
+                &mut dev.session,
+                gpt,
+                &item.partition,
+                &item.image,
+                progress,
+            )
+            .with_context(|| format!("колонка {serial}: восстановление {}", item.partition))?;
+        }
+        // Everything that is not a partition: the GPT (LBA 1) and the
+        // idblock (LBA 0x40), straight from the backup directory.
+        let dir = backup_dir(&serial);
+        let dev = self
+            .device
+            .as_mut()
+            .ok_or_else(|| anyhow!("устройство не поднято"))?;
+        for (file, lba, name) in [(".gpt.bin", 1u32, "gpt"), ("idblock.bin", 0x40, "idblock")] {
+            let Ok(data) = std::fs::read(dir.join(file)) else {
+                log::warn!("в бэкапе нет {file} — таблица/idblock не восстановлены");
+                continue;
+            };
+            crate::flash::write_lba_image(&mut dev.session, lba, name, &data, progress)
+                .with_context(|| format!("колонка {serial}: восстановление {name}"))?;
+        }
+        Ok(())
     }
 
     fn finish(&mut self, _progress: ProgressFn) -> Result<()> {
@@ -275,24 +422,19 @@ impl Platform for Rockchip {
     }
 }
 
-/// Backup directory for a column: backup/<sanitized serial>.
+/// Backup directory for a column: backup/capsule/<sanitized serial>
+/// (per-model layout — identity keys of different platforms may
+/// collide).
 fn backup_dir(serial: &str) -> PathBuf {
-    Path::new("backup").join(BackupStore::dir_name(serial))
+    Path::new("backup")
+        .join(Model::Capsule.dir_name())
+        .join(BackupStore::dir_name(serial))
 }
 
 impl Rockchip {
-    /// Bring-up + dump with the driver-rebind retries (steps 1–3 of the
-    /// scenario); --no-backup skips the dump entirely. On a regular
-    /// column the session runs our usbplug with the read-limit patch
-    /// (fully readable dump); on first generation it stays on the stock
-    /// loader (330d) and the dump is NOT intact: everything above the
-    /// 32 MiB read mask reads back as 0xCC.
-    fn dump_all(
-        &mut self,
-        wait: Option<Duration>,
-        no_backup: bool,
-        progress: ProgressFn,
-    ) -> Result<Device> {
+    /// Connect with the driver-rebind retries: bring-up staying on the
+    /// stock loader (identity only — no dump, no MaskROM round-trip).
+    fn connect_device(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Device> {
         if win_drv::any_rockchip_node_misbound() {
             log::info!("устройство Rockchip без WinUSB — ставлю драйвер");
             self.start_or_wait_drivers(Duration::from_secs(180));
@@ -300,7 +442,7 @@ impl Rockchip {
 
         const ATTEMPTS: u32 = 5;
         for attempt in 1..=ATTEMPTS {
-            match self.dump_all_once(wait, no_backup, progress) {
+            match self.connect_once(wait, progress) {
                 Ok(s) => return Ok(s),
                 Err(e) => {
                     let binding_error = win_drv::chain_is_binding_error(&e);
@@ -324,6 +466,190 @@ impl Rockchip {
             }
         }
         bail!("перебор попыток перевязки драйвера")
+    }
+
+    /// One connect attempt (no retries). The first-generation
+    /// classification lives in bring_up (session.rs): the returned
+    /// `firstgen` flag drives everything downstream.
+    fn connect_once(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Device> {
+        let loader = crate::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
+        let mut bus = crate::session::UsbBus;
+        let up = match crate::session::bring_up(
+            &mut bus,
+            &self.config,
+            &loader,
+            wait,
+            crate::session::Goal::StockLoader,
+            progress,
+        ) {
+            Ok(v) => v,
+            Err(crate::session::BringUpError::LoaderRejected) => bail!(
+                "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
+                 плата или первое поколение в MaskROM — отпустите Recovery и \
+                 войдите в режим лоадера заново)"
+            ),
+            Err(e) => return Err(e.into()),
+        };
+
+        log::info!("серийник колонки: {}", up.serial);
+        Ok(Device {
+            session: up.session,
+            serial: up.serial,
+            firstgen: up.firstgen,
+            usbplug: false,
+            dumped: false,
+        })
+    }
+
+    /// Dump with the driver-rebind retries (the old dump_all skeleton:
+    /// the switch to usbplug and the dump itself are retried when a
+    /// Windows driver rebind kills the session). On a regular column
+    /// the session runs our usbplug with the read-limit patch (fully
+    /// readable dump); on first generation it stays on the stock
+    /// loader (330d) and the dump is NOT intact: everything above the
+    /// 32 MiB read mask reads back as 0xCC.
+    fn dump_with_retries(
+        &mut self,
+        dir: &Path,
+        progress: ProgressFn,
+    ) -> Result<crate::backup::BackupReport> {
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            match self.dump_once(dir, progress) {
+                Ok(report) => return Ok(report),
+                Err(e) => {
+                    let binding_error = win_drv::chain_is_binding_error(&e);
+                    if binding_error && attempt < ATTEMPTS {
+                        log::warn!(
+                            "узел перехвачен чужим драйвером (попытка {attempt}/{ATTEMPTS}) — перевязываю"
+                        );
+                        self.start_or_wait_drivers(Duration::from_secs(120));
+                        continue;
+                    }
+                    if binding_error {
+                        // the driver supervisor could not win in ATTEMPTS tries
+                        return Err(e.context(format!(
+                            "драйвер WinUSB не установился; лог: {}\n\
+                             ручной путь: DRIVER-SETUP.txt (Zadig)",
+                            self.drivers.log_path().display()
+                        )));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        bail!("перебор попыток перевязки драйвера")
+    }
+
+    /// One dump attempt (no retries): make sure the session persona can
+    /// read the whole flash (usbplug on a regular column) and take the
+    /// dump. Re-attaches from whatever persona the board was left in
+    /// by a previous failed attempt.
+    fn dump_once(
+        &mut self,
+        dir: &Path,
+        progress: ProgressFn,
+    ) -> Result<crate::backup::BackupReport> {
+        let (serial, firstgen) = self
+            .device
+            .as_ref()
+            .map(|d| (d.serial.clone(), d.firstgen))
+            .ok_or_else(|| anyhow!("устройство не подключено"))?;
+        if !firstgen {
+            self.ensure_usbplug(progress)?;
+        }
+        let dev = self.device.as_mut().expect("проверено выше");
+        let report = crate::backup::backup(&mut dev.session, &self.config, dir, progress, firstgen)
+            .with_context(|| format!("колонка {serial}: дамп"))?;
+        let _ = std::fs::write(dir.join("serial.txt"), &serial);
+        self.device.as_mut().expect("проверено выше").dumped = true;
+        Ok(report)
+    }
+
+    /// Seal a finished dump as the v2 backup: hash the small extras,
+    /// publish `backup.json` atomically. The image checksums were
+    /// streamed during the dump (see [`crate::backup::backup`]).
+    fn seal_backup(
+        &self,
+        dir: &Path,
+        report: &crate::backup::BackupReport,
+    ) -> Result<catalog::BackupEntry> {
+        let mut extras = Vec::new();
+        for (file, role) in [
+            (".gpt.bin", "gpt"),
+            ("partition_table.tsv", "partition-table"),
+            ("serial.txt", "serial"),
+            ("idblock.bin", "idblock"),
+        ] {
+            let p = dir.join(file);
+            if let Ok(meta) = std::fs::metadata(&p) {
+                let sha256 = jb_core::backup_store::file_sha256(&p)?;
+                extras.push(catalog::FileEntry {
+                    file: file.to_string(),
+                    sha256,
+                    size: meta.len(),
+                    role: role.to_string(),
+                });
+            }
+        }
+        let masked = &report.masked;
+        let manifest = BackupManifest {
+            format: catalog::FORMAT,
+            model: Model::Capsule,
+            key: dir
+                .file_name()
+                .map(|k| k.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            created_utc: jb_core::format::utc_now_iso(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            status: if masked.is_empty() {
+                catalog::Status::Complete
+            } else {
+                catalog::Status::Partial
+            },
+            notes: if masked.is_empty() {
+                vec![]
+            } else {
+                vec![format!(
+                    "первое поколение: дамп нецелостный — выше 32 МиБ \
+                     стоковый лоадер отдаёт 0xCC ({})",
+                    masked.join(", ")
+                )]
+            },
+            images: report.images.clone(),
+            extras,
+        };
+        catalog::publish(dir, manifest).context("публикация backup.json")
+    }
+
+    /// Switch the connected regular column from the stock loader to
+    /// our usbplug session (the readable-dump persona). No-op when the
+    /// session is usbplug already; otherwise re-attaches — from the
+    /// loader persona, a leftover usbplug of ours or a raw MaskROM.
+    fn ensure_usbplug(&mut self, progress: ProgressFn) -> Result<()> {
+        let (serial, usbplug) = self
+            .device
+            .as_ref()
+            .map(|d| (d.serial.clone(), d.usbplug))
+            .ok_or_else(|| anyhow!("устройство не подключено"))?;
+        if usbplug {
+            return Ok(());
+        }
+        let loader = crate::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
+        let mut bus = crate::session::UsbBus;
+        let s = crate::session::reattach(&mut bus, &self.config, &loader, &serial, false, progress)
+            .map_err(|e| match e {
+                crate::session::BringUpError::LoaderRejected => anyhow!(
+                    "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
+                 плата или первое поколение в MaskROM — отпустите Recovery и \
+                 войдите в режим лоадера заново)"
+                ),
+                e => e.into(),
+            })?;
+        let dev = self.device.as_mut().expect("проверено выше");
+        dev.session = s;
+        dev.usbplug = true;
+        Ok(())
     }
 
     /// Make sure the driver supervisor is running, then wait for the board
@@ -352,79 +678,25 @@ impl Rockchip {
             }
         }
     }
-
-    /// One bring-up + dump attempt (no retries). The first-generation
-    /// classification lives in bring_up (session.rs): the returned
-    /// `firstgen` flag drives everything downstream.
-    fn dump_all_once(
-        &mut self,
-        wait: Option<Duration>,
-        no_backup: bool,
-        progress: ProgressFn,
-    ) -> Result<Device> {
-        let loader = crate::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
-        let mut bus = crate::session::UsbBus;
-        let up = match crate::session::bring_up(&mut bus, &self.config, &loader, wait, no_backup, progress)
-        {
-            Ok(v) => v,
-            Err(crate::session::BringUpError::LoaderRejected) => bail!(
-                "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
-                 плата или первое поколение в MaskROM — отпустите Recovery и \
-                 войдите в режим лоадера заново)"
-            ),
-            Err(e) => return Err(e.into()),
-        };
-
-        let serial = up.serial;
-        let firstgen = up.firstgen;
-        let mut s = up.session;
-        log::info!("серийник колонки: {serial}");
-        let dir = backup_dir(&serial);
-        // A verified backup of THIS column exists -> skip the dump
-        // and go straight to the userdata write. On the stock loader
-        // (first generation) the dump is NOT intact: everything above
-        // the 32 MiB read mask goes in as 0xCC — backup() says so itself.
-        let dumped = if no_backup {
-            log::info!(
-                "--no-backup: бэкап не проверяю и не снимаю — userdata будет \
-                 собран с нуля, текущее содержимое теряется"
-            );
-            false
-        } else if BackupStore::exists_verified(&dir) {
-            log::info!(
-                "бэкап уже есть в {} — дамп пропускаю (удалите каталог, чтобы \
-                 снять заново)",
-                dir.display()
-            );
-            false
-        } else {
-            crate::backup::backup(&mut s, &self.config, &dir, progress, firstgen)
-                .with_context(|| format!("колонка {serial}: дамп"))?;
-            let _ = std::fs::write(dir.join("serial.txt"), &serial);
-            true
-        };
-        Ok(Device {
-            session: s,
-            serial,
-            firstgen,
-            dumped,
-        })
-    }
 }
 
 /// The verified dump of this column (regular path), re-verified before
 /// it becomes the base of the only copy.
+/// The verified v2 backup of this column as the patch base (the
+/// userdata image), re-verified before it becomes the base of the only
+/// copy.
 fn image_base(dir: &Path) -> Result<Option<PathBuf>> {
-    let store = BackupStore::open(dir)
-        .context("нет валидного бэкапа этой колонки — запустите инструмент ещё раз")?;
-    store
+    let entry = catalog::read(dir).ok_or_else(|| {
+        anyhow!("нет валидного бэкапа этой колонки — запустите инструмент ещё раз")
+    })?;
+    entry
         .verify()
         .context("бэкап не прошёл проверку SHA256 — снимите дамп заново")?;
     Ok(Some(
-        store
-            .find("userdata")
+        entry
+            .image("userdata")
             .context("в бэкапе нет раздела userdata")?
-            .to_path_buf(),
+            .0,
     ))
 }
 

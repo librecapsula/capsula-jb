@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 use jb_core::format::humansize;
 use jb_core::progress::Progress;
 use jb_core::scenario::{Params, WritePlan};
+use jb_core::session::{Command as SessionCommand, Decision, Event, Session};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -29,21 +30,26 @@ use std::time::Duration;
 )]
 struct Cli {
     /// How many seconds to wait for the speaker on USB (0 = forever)
-    #[arg(long, value_name = "SEC", default_value = "0")]
+    #[arg(long, value_name = "SEC", default_value = "0", global = true)]
     wait: u64,
 
     /// Do not ask for confirmation before writing userdata (for scripts)
-    #[arg(long)]
+    #[arg(long, global = true)]
     yes: bool,
 
     /// Build a clean image instead of patching the dump (contents are lost)
-    #[arg(long)]
+    #[arg(long, global = true)]
     format_userdata: bool,
 
     /// Skip backup verification and capture: the image is built from
     /// scratch (contents are lost; edge cases — e.g. a broken directory)
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_backup: bool,
+
+    /// Do not put adbd into the overlay (only the gadget flag and the
+    /// jailbreak marker are written)
+    #[arg(long, global = true)]
+    no_adbd: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -53,9 +59,26 @@ struct Cli {
 enum Command {
     /// Only dump the partitions into backup/ (nothing is written to the speaker)
     Backup,
-    /// Restore the data partition from the verified backup (the
-    /// jailbreak rollback)
+    /// Restore everything restorable from the verified backup (the
+    /// full rollback: every intact partition image, plus the GPT and
+    /// the idblock on rockchip)
     Restore,
+    /// List the backups under backup/ — offline, no device needed
+    /// (what the TUI shows in its backup pane)
+    Backups {
+        /// Verify every listed backup (a full SHA256 pass over the files)
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Delete one backup directory — offline, no device needed
+    /// (the TUI's "delete backup" button)
+    #[command(name = "backup-delete")]
+    BackupDelete {
+        /// The model: capsule | capsula-mini
+        model: String,
+        /// The column key: the serial (capsule) or the deviceid (capsula-mini)
+        key: String,
+    },
     /// Live log of USB events
     Monitor,
     /// Amlogic Mini: identify the board and pass through u-boot burning
@@ -68,27 +91,33 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    // The logger comes first: all tool output (including the final
-    // error) goes through it, with millisecond timestamps.
-    logging::init();
-    // An elevated relaunch (Windows UAC manifest) may start in
-    // C:\Windows\System32; the tool writes backup/work relative to
-    // the CWD, so move next to the executable in that case.
-    if let Some(cwd) = win_drv::fix_cwd_if_system32() {
-        log::info!("рабочий каталог: {}", cwd.display());
-    }
-    // No arguments at all — the GUI (macOS/Windows). Any argument,
-    // even a bare global flag, keeps the CLI path below; Linux has no
-    // GUI build (gpui needs system X11/Wayland libraries) and keeps
-    // the CLI no-args scenario. Closing the window ends the process;
-    // the Windows console pause does not apply to the GUI.
-    #[cfg(not(target_os = "linux"))]
-    if std::env::args_os().skip(1).next().is_none() {
-        if let Err(e) = jb_gui::run() {
+    // No arguments at all AND an interactive terminal — the TUI (every
+    // platform). Any argument, even a bare global flag, keeps the CLI
+    // path below; a piped/redirected stdio (agents, CI) also falls
+    // through to the CLI — the TUI is for humans only, and the CLI
+    // confirm flow is the agent-facing contract. The TUI installs its
+    // own log bridge (the pane IS the log), so the CLI logger must not
+    // be initialized on this branch; quitting the TUI ends the process.
+    if std::env::args_os().nth(1).is_none() && interactive_terminal() {
+        // An elevated relaunch (Windows UAC manifest) may start in
+        // C:\Windows\System32; the tool writes backup/work relative to
+        // the CWD, so move next to the executable in that case. (The
+        // log line is not shown: the bridge is installed inside
+        // jb_tui::run, after this point.)
+        let _ = win_drv::fix_cwd_if_system32();
+        if let Err(e) = jb_tui::run(backend::backends()) {
+            // the TUI is torn down; the detached log bridge prints
+            // this with a timestamp
             log::error!("{e:?}");
             std::process::exit(1);
         }
         return Ok(());
+    }
+    // The logger comes first: all tool output (including the final
+    // error) goes through it, with millisecond timestamps.
+    logging::init();
+    if let Some(cwd) = win_drv::fix_cwd_if_system32() {
+        log::info!("рабочий каталог: {}", cwd.display());
     }
     let cli = Cli::parse();
     let wait = if cli.wait == 0 {
@@ -119,74 +148,132 @@ fn main() -> anyhow::Result<()> {
 
 /// Parse the subcommand and run the scenario; all errors go through
 /// the return value (intercepted in main and logged with a timestamp).
+/// The scenario runs on the session worker thread; this loop is the
+/// UI side: progress bars, confirmations, the final result.
 fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
     let p = progress::CliProgress::new();
-    let progress = |ev: Progress| p.handle(ev);
-    match cli.command {
-        None => {
-            let params = Params {
-                format_userdata: cli.format_userdata,
-                no_backup: cli.no_backup,
-                wait,
-            };
-            let confirm = confirm_write(cli.yes);
-            backend::pick_backend(wait)?.jailbreak(&params, &confirm, &progress)
-        }
+    // The offline commands do not wait for a device and do not build a
+    // driver session.
+    match &cli.command {
+        // The live bus log.
+        Some(Command::Monitor) => return monitor_bus(),
+        Some(Command::Backups { verify }) => return list_backups(*verify),
+        Some(Command::BackupDelete { model, key }) => return delete_backup(model, key, cli.yes),
+        _ => {}
+    }
+    let session = Session::spawn(backend::backends(), wait);
+    // The command is known upfront; queue it — the worker serves it
+    // once a device connects.
+    session.command(match &cli.command {
+        None => SessionCommand::Jailbreak(Params {
+            format_userdata: cli.format_userdata,
+            no_backup: cli.no_backup,
+            adbd: !cli.no_adbd,
+        }),
         Some(Command::Backup) => {
             if cli.no_backup {
                 bail!("--no-backup несовместим с подкомандой backup");
             }
-            backend::pick_backend(wait)?.backup(wait, &progress)
+            SessionCommand::Backup
         }
         Some(Command::Restore) => {
             if cli.no_backup {
                 bail!("--no-backup несовместим с подкомандой restore");
             }
-            let confirm = confirm_write(cli.yes);
-            backend::pick_backend(wait)?.restore(wait, &confirm, &progress)
+            SessionCommand::Restore
         }
-        // The monitor does not wait for a device and does not build a
-        // driver session — just the live bus log.
-        Some(Command::Monitor) => monitor_bus(),
-        // Passthrough is Amlogic Mini diagnostics, outside the main scenario.
+        // Handled above (the offline commands return before the session).
+        Some(Command::Monitor) => unreachable!("monitor handled above"),
+        Some(Command::Backups { .. }) | Some(Command::BackupDelete { .. }) => {
+            unreachable!("offline commands handled above")
+        }
+        // Passthrough is Amlogic Mini diagnostics, outside the session.
         Some(Command::Aml { cmds }) => {
-            jb_amlogic::diag::passthrough(wait, &cmds, &progress)
+            return jb_amlogic::diag::passthrough(wait, cmds, &|ev: Progress| p.handle(ev));
+        }
+    });
+    // A refused confirmation with its own actionable error (the
+    // non-interactive stdin message): substituted for the worker's
+    // generic "прервано пользователем" below.
+    let mut abort_reason: Option<anyhow::Error> = None;
+    loop {
+        match session.events().recv() {
+            Ok(Event::WaitingForDevice { hints }) => {
+                for h in hints {
+                    log::info!("{h}");
+                }
+            }
+            Ok(Event::DeviceConnected { identity }) => {
+                log::info!("колонка: {} ({})", identity.key, identity.model.label())
+            }
+            // The platform logs the backup details inside
+            // ensure_backup; nothing to add here.
+            Ok(Event::BackupState(_)) => {}
+            Ok(Event::Progress(ev)) => p.handle(ev),
+            Ok(Event::ConfirmRequested { plan, reply }) => match confirm_write(&plan, cli.yes) {
+                Ok(()) => {
+                    let _ = reply.send(Decision::Proceed);
+                }
+                Err(e) => {
+                    abort_reason = Some(e);
+                    let _ = reply.send(Decision::Abort);
+                }
+            },
+            Ok(Event::Finished(result)) => {
+                return match (result, abort_reason) {
+                    (Err(e), Some(reason)) if e.to_string() == "прервано пользователем" => {
+                        Err(reason)
+                    }
+                    (r, _) => r,
+                };
+            }
+            Err(_) => bail!("поток сессии завершился неожиданно"),
         }
     }
 }
 
-/// Write confirmation (skipped with --yes). The skeleton calls it after
-/// measuring the partition and BEFORE any writing action — a refusal is
-/// safe. One wording for all platforms: the partition name, size and
-/// mode description come from the platform's WritePlan.
-fn confirm_write(yes: bool) -> impl Fn(&WritePlan) -> anyhow::Result<()> {
-    move |plan: &WritePlan| {
-        if yes {
-            return Ok(());
-        }
-        let verb = if plan.restore { "восстановление" } else { "запись" };
-        log::info!(
-            "{verb} {} ({}): {}",
-            plan.partition,
-            humansize(plan.size),
-            plan.mode
-        );
-        log::info!("продолжить? [y/N]");
-        ask_yes()
+/// Write confirmation (skipped with --yes). The scenario requests it
+/// after measuring the partition and BEFORE any writing action — a
+/// refusal is safe. One wording for all platforms: the partition name,
+/// size and mode description come from the platform's WritePlan.
+fn confirm_write(plan: &WritePlan, yes: bool) -> anyhow::Result<()> {
+    if yes {
+        return Ok(());
     }
+    let verb = if plan.restore {
+        "восстановление"
+    } else {
+        "запись"
+    };
+    log::info!(
+        "{verb} {} ({}): {}",
+        plan.partition,
+        humansize(plan.size),
+        plan.mode
+    );
+    log::info!("продолжить? [y/N]");
+    ask_yes("записи", "ничего не записано")
 }
 
-fn ask_yes() -> anyhow::Result<()> {
+/// Both stdin and stdout are terminals — a human at a console (the
+/// TUI gate). Anything piped/redirected (an agent shell, CI) is NOT
+/// interactive, whatever the controlling terminal is.
+fn interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// The [y/N] prompt. Non-interactive stdin (CI, LLM agent shells,
+/// redirected input): never hang on a prompt nobody can answer — fail
+/// with an actionable message instead. Nothing has been done at this
+/// point, so an exit is safe.
+fn ask_yes(what: &str, not_done: &str) -> anyhow::Result<()> {
     use std::io::{IsTerminal, Write};
-    // Non-interactive stdin (CI, LLM agent shells, redirected input):
-    // never hang on a prompt nobody can answer — fail with an
-    // actionable message instead. Nothing has been written at this
-    // point, so an exit is safe.
     std::io::stdout().flush().ok();
     if !std::io::stdin().is_terminal() {
         bail!(
-            "нужно подтверждение записи, но stdin не интерактивен; ничего \
-             не записано. Согласуйте запись и перезапустите с --yes"
+            "нужно подтверждение {what}, но stdin не интерактивен; {not_done}. \
+             Согласуйте с пользователем и перезапустите с --yes"
         );
     }
     let mut ans = String::new();
@@ -226,4 +313,73 @@ fn monitor_bus() -> anyhow::Result<()> {
         }
         std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
     }
+}
+
+/// `capsula-jb backups` — the offline backup listing: everything the
+/// TUI's backup pane shows, for agents and scripts. `--verify` adds
+/// the full SHA256 pass over every listed directory.
+fn list_backups(verify: bool) -> anyhow::Result<()> {
+    let entries = jb_core::backup_catalog::scan(std::path::Path::new("backup"));
+    if entries.is_empty() {
+        log::info!("бэкапов нет (каталог backup/ пуст или отсутствует)");
+        return Ok(());
+    }
+    for e in &entries {
+        let status = match e.manifest.status {
+            jb_core::backup_catalog::Status::Complete => "полный",
+            jb_core::backup_catalog::Status::Partial => "с оговорками",
+        };
+        log::info!(
+            "{} {}: {} · {} · {}",
+            e.manifest.model.label(),
+            e.manifest.key,
+            e.manifest.created_utc,
+            humansize(e.total_bytes()),
+            status,
+        );
+        log::info!("  каталог: {}", e.dir.display());
+        for note in &e.manifest.notes {
+            log::info!("  заметка: {note}");
+        }
+        if verify {
+            match e.verify() {
+                Ok(()) => log::info!("  проверка: ок"),
+                Err(err) => log::error!("  проверка: НЕ сошлась: {err}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `capsula-jb backup-delete <model> <key>` — the offline twin of the
+/// TUI's "delete backup" button. The confirmation follows the write
+/// rules: interactive [y/N], non-interactive (agents) refuses and
+/// points at --yes.
+fn delete_backup(model: &str, key: &str, yes: bool) -> anyhow::Result<()> {
+    let model = match model {
+        "capsule" => jb_core::session::Model::Capsule,
+        "capsula-mini" => jb_core::session::Model::CapsuleMini,
+        other => bail!("неизвестная модель {other:?} (capsule | capsula-mini)"),
+    };
+    let Some(entry) = jb_core::backup_catalog::open(std::path::Path::new("backup"), model, key)
+    else {
+        bail!("бэкап не найден: backup/{}/{key}", model.dir_name());
+    };
+    log::info!(
+        "удалить бэкап {} · {} · {}?",
+        entry.dir.display(),
+        model.label(),
+        humansize(entry.total_bytes())
+    );
+    for note in &entry.manifest.notes {
+        log::info!("  заметка: {note}");
+    }
+    log::info!("продолжить? [y/N]");
+    if !yes {
+        ask_yes("удаления", "бэкап не удалён")?;
+    }
+    let dir = entry.dir.clone();
+    entry.delete()?;
+    log::info!("удалён: {}", dir.display());
+    Ok(())
 }

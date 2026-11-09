@@ -66,3 +66,47 @@ pub fn write_partition_padded<T: Transport>(
     });
     Ok(())
 }
+
+/// Write raw sectors at a fixed LBA — the restore path for what is
+/// not a GPT partition: the table itself (LBA 1, 34 sectors) and the
+/// idblock (LBA 0x40). `name` labels the progress lines. Chunked like
+/// a partition write.
+pub fn write_lba_image<T: Transport>(
+    s: &mut LoaderSession<T>,
+    lba: u32,
+    name: &str,
+    data: &[u8],
+    progress: ProgressFn,
+) -> rockusb::Result<()> {
+    if data.is_empty() || !data.len().is_multiple_of(512) {
+        return Err(UsbError::Loader(format!(
+            "{name}: размер не кратен сектору ({})",
+            data.len()
+        )));
+    }
+    let sectors = (data.len() / 512) as u64;
+    progress(Progress::PartitionStart {
+        name: name.to_string(),
+        sectors,
+    });
+    let mut done: u64 = 0;
+    while done < sectors {
+        let n = (sectors - done).min(CHUNK_SECTORS as u64) as usize;
+        let off = done as usize * 512;
+        s.write_lba(
+            lba.checked_add(done as u32)
+                .ok_or_else(|| UsbError::Loader(format!("{name}: LBA за пределами u32")))?,
+            &data[off..off + n * 512],
+        )?;
+        done += n as u64;
+        progress(Progress::PartitionProgress {
+            name: name.to_string(),
+            done,
+            total: sectors,
+        });
+    }
+    progress(Progress::PartitionDone {
+        name: name.to_string(),
+    });
+    Ok(())
+}

@@ -2,10 +2,10 @@
 //! sequences after rock.c of xrock, MaskROM upload with CRC/RC4 and the
 //! edge cases.
 
-use rockusb::loader::{opcode, LoaderSession, RESET_SUBCODE_MASKROM};
+use rockusb::loader::{LoaderSession, RESET_SUBCODE_MASKROM, opcode};
 use rockusb::maskrom::MaskRomSession;
 use rockusb::mock::{MockTransport, Step};
-use rockusb::util::{crc16_xrock, Rc4};
+use rockusb::util::{Rc4, crc16_xrock};
 
 const EP_IN: u8 = 0x81;
 const EP_OUT: u8 = 0x02;

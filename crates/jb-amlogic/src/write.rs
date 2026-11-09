@@ -25,7 +25,7 @@
 //! which makes the all-or-nothing restart cheap.
 
 use amlogic::store::NAND_WRITE_CHUNK;
-use amlogic::{nand, AmlogicSession, Transport};
+use amlogic::{AmlogicSession, Transport, nand};
 use anyhow::ensure;
 use std::io::{Read, Seek, SeekFrom};
 

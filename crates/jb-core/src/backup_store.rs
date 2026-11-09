@@ -81,28 +81,27 @@ impl BackupStore {
         if tsv.is_file() {
             for line in std::fs::read_to_string(&tsv)?.lines() {
                 let mut it = line.split('\t');
-                if let (Some(idx), Some(name)) = (it.next(), it.next()) {
-                    if let (Ok(idx), Some(name)) = (idx.parse::<u32>(), it.next().map(|_| name)) {
-                        let f = dir.join(Self::image_name(idx, name));
-                        if f.is_file() {
-                            files.insert(name.to_string(), f);
-                        }
+                if let (Some(idx), Some(name)) = (it.next(), it.next())
+                    && let (Ok(idx), Some(name)) = (idx.parse::<u32>(), it.next().map(|_| name))
+                {
+                    let f = dir.join(Self::image_name(idx, name));
+                    if f.is_file() {
+                        files.insert(name.to_string(), f);
                     }
                 }
             }
         } else {
             for e in std::fs::read_dir(dir)? {
                 let p = e?.path();
-                if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
-                    if n.ends_with(".img")
-                        && n.len() >= 6
-                        && n.as_bytes()[0].is_ascii_digit()
-                        && n.as_bytes()[1].is_ascii_digit()
-                        && n.as_bytes()[2] == b'_'
-                    {
-                        let part = n[3..n.len() - 4].to_string();
-                        files.insert(part, p);
-                    }
+                if let Some(n) = p.file_name().and_then(|n| n.to_str())
+                    && n.ends_with(".img")
+                    && n.len() >= 6
+                    && n.as_bytes()[0].is_ascii_digit()
+                    && n.as_bytes()[1].is_ascii_digit()
+                    && n.as_bytes()[2] == b'_'
+                {
+                    let part = n[3..n.len() - 4].to_string();
+                    files.insert(part, p);
                 }
             }
         }
@@ -536,9 +535,11 @@ mod tests {
         let mut file = capture.create_file("boot.bin.partial").unwrap();
         file.write_all(b"new").unwrap();
         drop(file);
-        assert!(capture
-            .publish_partial("boot.bin.partial", "boot.bin")
-            .is_err());
+        assert!(
+            capture
+                .publish_partial("boot.bin.partial", "boot.bin")
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(capture.path().join("boot.bin")).unwrap(),
             b"old"

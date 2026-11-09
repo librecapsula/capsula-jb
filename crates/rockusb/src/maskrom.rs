@@ -4,7 +4,7 @@
 use crate::error::Result;
 use crate::loader_container::LoaderContainer;
 use crate::transport::Transport;
-use crate::util::{crc16_xrock, Rc4};
+use crate::util::{Rc4, crc16_xrock};
 
 const CHUNK: usize = 4096;
 

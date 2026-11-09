@@ -34,7 +34,7 @@ pub use loader_container::LoaderContainer;
 pub use maskrom::MaskRomSession;
 pub use monitor::DeviceMonitor;
 pub use transport::{
-    current_mode, device_serial, list_modes, DeviceMode, NusbTransport, Transport,
+    DeviceMode, NusbTransport, Transport, current_mode, device_serial, list_modes,
 };
 
 /// USB VID of all Rockchip modes.

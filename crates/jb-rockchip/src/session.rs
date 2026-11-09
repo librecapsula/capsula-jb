@@ -145,24 +145,39 @@ fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: Progress
     progress(Progress::Step(msg));
 }
 
+/// What the caller needs from bring-up. The session persona follows
+/// the goal; the first generation always ends on the stock loader (its
+/// locked BootROM rejects our usbplug).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Goal {
+    /// Identity + the below-mask range (GPT at LBA 1, stock WRITE_LBA):
+    /// the stock loader (330d) is enough — connect and --no-backup
+    /// runs. No MaskROM round-trip, no RAM download.
+    StockLoader,
+    /// A session that can read above the stock 32 MiB read mask (the
+    /// full dump): our usbplug loaded into RAM. First generation
+    /// cannot and stays on the stock loader (`firstgen = true` tells
+    /// the caller).
+    UsbPlug,
+}
+
 /// Bring the board into a working session. Returns the session with the
 /// column identity serial (the backup key) and the `firstgen` flag that
-/// selects the further path. The serial is read exactly ONCE — when the
-/// loader persona (330d) is recognized — and is kept for the whole
+/// selects the further path. The serial is read exactly ONCE — when
+/// the loader persona (330d) is recognized — and is kept for the whole
 /// session; other personas never contribute (the BootROM gadget reports
 /// zeros). Every session MUST have an identifying serial: a persona
 /// that cannot identify the column (a leftover usbplug, a direct
 /// MaskROM entry, a broken serial read) is refused with a re-entry
 /// instruction, and only the loader persona is accepted afterwards.
 ///
-/// - Loader (330d) with a regular serial: reset into MaskROM and load
-///   our loader (the RAM-patch constants do not apply to the stock
-///   u-boot usbplug) — unless `no_backup`: that run never reads above
-///   the stock read mask (the dump is skipped), so the stock loader
-///   itself is returned and the MaskROM round-trip is skipped;
 /// - Loader (330d) with a first-generation serial: the stock loader
 ///   itself — `firstgen = true` (our loader would be rejected by its
 ///   locked BootROM);
+/// - Loader (330d) with a regular serial: [`Goal::StockLoader`] keeps
+///   the stock loader; [`Goal::UsbPlug`] resets into MaskROM and loads
+///   our loader (the RAM-patch constants do not apply to the stock
+///   u-boot usbplug);
 /// - raw MaskROM (330e) with the serial already captured: download the
 ///   loader into RAM (flash untouched);
 /// - empty bus / Linux gadget: print the hint and wait for a download mode.
@@ -171,7 +186,7 @@ pub fn bring_up<B: Bus>(
     config: &Config,
     loader: &LoaderContainer,
     wait: Option<Duration>,
-    no_backup: bool,
+    goal: Goal,
     progress: ProgressFn,
 ) -> Result<BroughtUp<B::T>, BringUpError> {
     let hint = &config.hint.text;
@@ -181,13 +196,13 @@ pub fn bring_up<B: Bus>(
     // proceed, whatever else appears on the bus.
     let mut wait_loader: Option<Instant> = None;
     loop {
-        if let (Some(limit), Some(at)) = (wait, wait_loader) {
-            if at.elapsed() >= limit {
-                return Err(UsbError::WrongMode(
-                    "не дождался повторного входа в режим лоадера (--wait)".into(),
-                )
-                .into());
-            }
+        if let (Some(limit), Some(at)) = (wait, wait_loader)
+            && at.elapsed() >= limit
+        {
+            return Err(UsbError::WrongMode(
+                "не дождался повторного входа в режим лоадера (--wait)".into(),
+            )
+            .into());
         }
         let mode = bus.poll()?;
         let Some(mode) = mode else {
@@ -202,8 +217,8 @@ pub fn bring_up<B: Bus>(
             rockusb::DeviceMode::Loader => {
                 // Read the identity exactly once, BEFORE the MaskROM
                 // reset consumes the persona. A first-generation serial
-                // or a --no-backup run also switches the whole scenario
-                // to the stock loader: the reset itself would kick the
+                // or a stock-loader goal also keeps the whole scenario
+                // on the stock loader: the reset itself would kick the
                 // running stock loader — keep it instead.
                 if serial.is_none() {
                     serial = Some(normalize_serial(bus.loader_serial()));
@@ -220,13 +235,13 @@ pub fn bring_up<B: Bus>(
                 let serial = serial.clone().unwrap();
                 let firstgen = is_first_generation(&serial);
                 // Both stay on the stock loader: first generation
-                // cannot run our usbplug at all, and a --no-backup run
-                // never reads above the stock read mask.
-                if firstgen || no_backup {
+                // cannot run our usbplug at all, and a stock-loader
+                // goal never reads above the stock read mask.
+                if firstgen || goal == Goal::StockLoader {
                     let why = if firstgen {
                         "первое поколение"
                     } else {
-                        "--no-backup"
+                        "без выгрузки usbplug"
                     };
                     let session = attach_stock_loader(bus, progress, why)?;
                     return Ok(BroughtUp {
@@ -235,26 +250,12 @@ pub fn bring_up<B: Bus>(
                         firstgen,
                     });
                 }
-                // Sanity-check the pipe over one session and reset into
-                // MaskROM: a wedged loader endpoint fails every transfer
-                // and can only be fixed by re-entering the loader mode.
-                progress(Progress::Step("лоадер (330d): сбрасываю в MaskROM".into()));
-                let mut s = bus.open_loader()?;
-                if let Err(e) = s.ready() {
-                    return Err(UsbError::WrongMode(format!(
-                        "лоадер (330d) не отвечает ({e}): передёрните \
-                         питание и войдите в режим лоадера заново"
-                    ))
-                    .into());
-                }
-                if let Err(e) = s.reset(RESET_SUBCODE_MASKROM) {
-                    return Err(UsbError::WrongMode(format!(
-                        "сброс в MaskROM отклонён ({e}): передёрните \
-                         питание и войдите в режим лоадера заново"
-                    ))
-                    .into());
-                }
-                bus.wait_mode(rockusb::DeviceMode::MaskRom, Duration::from_secs(15))?;
+                let session = load_usbplug(bus, config, loader, progress)?;
+                return Ok(BroughtUp {
+                    session,
+                    serial,
+                    firstgen: false,
+                });
             }
             rockusb::DeviceMode::MaskRom => {
                 // no serial read here: the identity is the loader serial
@@ -265,25 +266,9 @@ pub fn bring_up<B: Bus>(
                     std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
                     continue;
                 };
-                progress(Progress::Step(
-                    "MaskROM: загружаю лоадер в RAM (флеш не трогаю)".into(),
-                ));
-                {
-                    let mut m = MaskRomSession::new(bus.open_maskrom()?);
-                    m.download(loader)?;
-                }
-                progress(Progress::Step("жду usbplug (до 20 с)".into()));
-                if bus
-                    .wait_mode(rockusb::DeviceMode::UsbPlug, Duration::from_secs(20))
-                    .is_err()
-                {
-                    progress(Progress::Step("usbplug не поднялся".into()));
-                    return Err(BringUpError::LoaderRejected);
-                }
-                let mut s = bus.open_loader()?;
-                verify_usbplug_signatures(&mut s, config, progress)?;
+                let session = download_usbplug(bus, config, loader, progress)?;
                 return Ok(BroughtUp {
-                    session: s,
+                    session,
                     serial: ident,
                     firstgen: false,
                 });
@@ -311,6 +296,119 @@ pub fn bring_up<B: Bus>(
             }
         }
     }
+}
+
+/// Re-attach a KNOWN column after a mid-operation failure (a Windows
+/// driver rebind, a wedged endpoint). Unlike [`bring_up`], every
+/// persona is acceptable — the identity was read once already: the
+/// loader persona re-reads the serial and refuses a different column,
+/// a sighted usbplug is opened directly (its persona carries no
+/// serial). First generation re-attaches the stock loader; a regular
+/// column ends on a verified usbplug session ([`Goal::UsbPlug`]).
+pub fn reattach<B: Bus>(
+    bus: &mut B,
+    config: &Config,
+    loader: &LoaderContainer,
+    serial: &str,
+    firstgen: bool,
+    progress: ProgressFn,
+) -> Result<LoaderSession<B::T>, BringUpError> {
+    let hint = &config.hint.text;
+    loop {
+        let mode = bus.poll()?;
+        let Some(mode) = mode else {
+            bus.wait_download_mode(None, hint)?;
+            continue;
+        };
+        match mode {
+            rockusb::DeviceMode::Loader => {
+                let seen = normalize_serial(bus.loader_serial());
+                if seen != serial {
+                    return Err(UsbError::WrongMode(format!(
+                        "на шине другая колонка ({seen}), жду {serial}"
+                    ))
+                    .into());
+                }
+                if firstgen {
+                    return attach_stock_loader(bus, progress, "первое поколение")
+                        .map_err(BringUpError::Usb);
+                }
+                return load_usbplug(bus, config, loader, progress);
+            }
+            rockusb::DeviceMode::MaskRom => return download_usbplug(bus, config, loader, progress),
+            // our own leftover usbplug from the interrupted attempt —
+            // the identity is known, open it
+            rockusb::DeviceMode::UsbPlug => {
+                let mut s = bus.open_loader()?;
+                verify_usbplug_signatures(&mut s, config, progress)?;
+                return Ok(s);
+            }
+            other => {
+                log::info!("режим {}, жду download-режим", other.label());
+                bus.wait_download_mode(None, hint)?;
+                continue;
+            }
+        }
+    }
+}
+
+/// From a live loader persona (330d): sanity-check the pipe, reset into
+/// MaskROM, download our loader and open the verified usbplug session.
+/// A wedged loader endpoint fails every transfer and can only be fixed
+/// by re-entering the loader mode.
+fn load_usbplug<B: Bus>(
+    bus: &mut B,
+    config: &Config,
+    loader: &LoaderContainer,
+    progress: ProgressFn,
+) -> Result<LoaderSession<B::T>, BringUpError> {
+    progress(Progress::Step("лоадер (330d): сбрасываю в MaskROM".into()));
+    let mut s = bus.open_loader()?;
+    if let Err(e) = s.ready() {
+        return Err(UsbError::WrongMode(format!(
+            "лоадер (330d) не отвечает ({e}): передёрните \
+             питание и войдите в режим лоадера заново"
+        ))
+        .into());
+    }
+    if let Err(e) = s.reset(RESET_SUBCODE_MASKROM) {
+        return Err(UsbError::WrongMode(format!(
+            "сброс в MaskROM отклонён ({e}): передёрните \
+             питание и войдите в режим лоадера заново"
+        ))
+        .into());
+    }
+    bus.wait_mode(rockusb::DeviceMode::MaskRom, Duration::from_secs(15))?;
+    download_usbplug(bus, config, loader, progress)
+}
+
+/// The board is in MaskROM: download our loader into RAM (flash
+/// untouched), wait for the usbplug persona and open a verified
+/// session.
+fn download_usbplug<B: Bus>(
+    bus: &mut B,
+    config: &Config,
+    loader: &LoaderContainer,
+    progress: ProgressFn,
+) -> Result<LoaderSession<B::T>, BringUpError> {
+    progress(Progress::Step(
+        "MaskROM: загружаю лоадер в RAM (флеш не трогаю)".into(),
+    ));
+    {
+        let mut m = MaskRomSession::new(bus.open_maskrom()?);
+        m.download(loader)?;
+    }
+    progress(Progress::Step("жду usbplug (до 20 с)".into()));
+    if bus
+        .wait_mode(rockusb::DeviceMode::UsbPlug, Duration::from_secs(20))
+        .is_err()
+    {
+        progress(Progress::Step("usbplug не поднялся".into()));
+        return Err(BringUpError::LoaderRejected);
+    }
+    let mut s = bus.open_loader()?;
+    verify_usbplug_signatures(&mut s, config, progress)?;
+    Ok(s)
 }
 
 /// Open and sanity-check the stock rockusb loader (330d) and keep it as

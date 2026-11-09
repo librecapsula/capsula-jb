@@ -232,7 +232,7 @@ mod tests {
         let ecrc = crc32(&blob);
         hdr[88..92].copy_from_slice(&ecrc.to_le_bytes());
         hdr[40..48].copy_from_slice(&34u64.to_le_bytes()); // first usable
-                                                           // last usable: past the last partition, within the flash
+        // last usable: past the last partition, within the flash
         let last_usable = entries.last().map(|(_, f, n)| f + n + 16).unwrap_or(4000);
         hdr[48..56].copy_from_slice(&last_usable.to_le_bytes());
         hdr[16..20].fill(0);

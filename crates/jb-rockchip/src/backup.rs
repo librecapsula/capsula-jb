@@ -2,9 +2,9 @@
 //! Bring-up (MaskROM -> loader into RAM -> signatures) is done by the
 //! session BEFORE this is called.
 
-use jb_core::backup_store::{append_sha256_line, file_sha256};
-use jb_core::config::Config;
 use crate::session::read_gpt;
+use jb_core::backup_catalog::ImageEntry;
+use jb_core::config::Config;
 use jb_core::progress::{Progress, ProgressFn};
 use rockusb::loader::LoaderSession;
 use rockusb::{Error as UsbError, Transport};
@@ -25,6 +25,13 @@ pub struct BackupReport {
     /// The limit value before the RAM patch; None when running on the
     /// stock loader (first generation) — there is no patch there.
     pub read_limit_old: Option<u32>,
+    /// The dumped images with their streamed checksums — the caller
+    /// seals them into the v2 manifest (`backup_catalog::publish`).
+    pub images: Vec<ImageEntry>,
+    /// Partitions whose content crossed the stock read mask (first
+    /// generation): the file is there, the content above the mask is
+    /// 0xCC garbage.
+    pub masked: Vec<String>,
 }
 
 /// Patch the usbplug read limit in RAM: without it,
@@ -83,8 +90,10 @@ pub fn cc_guard<T: Transport>(
     Ok(())
 }
 
-/// Back up every partition into `out_dir` (v1-compatible layout).
-/// The caller has done bring_up: signatures verified.
+/// Back up every partition into `out_dir`. The caller has done
+/// bring_up: signatures verified, and seals the v2 manifest from the
+/// returned report (`backup_catalog::publish`) after writing the
+/// directory extras (serial.txt).
 ///
 /// On `stock_loader` (first generation, 330d u-boot) neither the RAM
 /// patch nor the guard is possible: everything above the stock read
@@ -114,11 +123,22 @@ pub fn backup<T: Transport>(
     std::fs::create_dir_all(out_dir)?;
     std::fs::write(out_dir.join(".gpt.bin"), &gpt_raw)?;
     std::fs::write(out_dir.join("partition_table.tsv"), gpt.to_tsv())?;
-    // Both markers must go before the first partition is written: an
-    // interrupted re-dump into an old directory would otherwise leave a
-    // stale SUCCESS.txt next to partial sums and pass as a valid backup.
-    let _ = std::fs::remove_file(out_dir.join("SUCCESS.txt"));
-    let _ = std::fs::remove_file(out_dir.join("SHA256SUMS.txt"));
+    // The idblock — the BootROM's flash image table at LBA 0x40 —
+    // lives OUTSIDE every GPT partition (the gap between the table
+    // and the first partition), so the GPT-driven dump never sees it;
+    // read it separately. 4 sectors, far below the stock read mask —
+    // works on both the usbplug and the stock loader (first
+    // generation). Documentation-grade: nothing flashes it back.
+    progress(Progress::Step("idblock (LBA 0x40)".into()));
+    let mut idblock = vec![0u8; 4 * 512];
+    s.read_lba(0x40, &mut idblock)?;
+    std::fs::write(out_dir.join("idblock.bin"), &idblock)?;
+    // The v2 manifest must go before the first partition is written:
+    // an interrupted re-dump into an old directory would otherwise
+    // leave a stale backup.json next to fresh-but-partial files.
+    let _ = std::fs::remove_file(out_dir.join(jb_core::backup_catalog::MANIFEST));
+    let _ =
+        std::fs::remove_file(out_dir.join(format!("{}.tmp", jb_core::backup_catalog::MANIFEST)));
 
     let info = s.flash_detect()?;
     progress(Progress::Step(format!(
@@ -127,6 +147,7 @@ pub fn backup<T: Transport>(
         info.sector_total
     )));
 
+    let mut images: Vec<ImageEntry> = Vec::new();
     let mut masked: Vec<String> = Vec::new();
     for e in &gpt.entries {
         let file_name = jb_core::backup_store::BackupStore::image_name(e.idx, &e.name);
@@ -138,13 +159,16 @@ pub fn backup<T: Transport>(
         // On the stock loader everything from GUARD_LBA up reads back
         // as 0xCC: a partition fully above the mask dumps as garbage,
         // a straddling one (boot_b) keeps only its prefix below it.
-        if stock_loader && e.first_lba + e.sectors > GUARD_LBA as u64 {
+        let complete = if stock_loader && e.first_lba + e.sectors > GUARD_LBA as u64 {
             masked.push(e.name.clone());
             progress(Progress::Step(format!(
                 "{}: выше маски чтения — в дампе 0xCC",
                 e.name
             )));
-        }
+            false
+        } else {
+            true
+        };
         let mut out = std::fs::File::create(&path)?;
         let mut hasher = Sha256::new();
         // one reusable full-chunk buffer; the last chunk of a partition
@@ -186,9 +210,14 @@ pub fn backup<T: Transport>(
                 e.sectors * 512
             )));
         }
-        // checksum by an independent pass (sha256sum-compatible)
-        let hex = file_sha256(&path).map_err(|e| UsbError::Loader(e.to_string()))?;
-        append_sha256_line(out_dir, &file_name, &hex).map_err(rockusb::Error::Io)?;
+        // the checksum was streamed while dumping — no second pass
+        images.push(ImageEntry {
+            partition: e.name.clone(),
+            file: file_name,
+            sha256: hex::encode(hasher.finalize()),
+            size,
+            complete,
+        });
         progress(Progress::PartitionDone {
             name: e.name.clone(),
         });
@@ -202,10 +231,6 @@ pub fn backup<T: Transport>(
         )));
     }
 
-    std::fs::write(
-        out_dir.join("SUCCESS.txt"),
-        format!("SUCCESS: {}\n", out_dir.display()),
-    )?;
     progress(Progress::Step(format!(
         "готово: {} (дамп по GPT, не сырой NAND)",
         out_dir.display()
@@ -215,5 +240,7 @@ pub fn backup<T: Transport>(
         partitions: gpt.entries.len(),
         sectors_total: info.sector_total as u64,
         read_limit_old: old_limit,
+        images,
+        masked,
     })
 }

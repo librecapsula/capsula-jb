@@ -1,4 +1,4 @@
-use amlogic::{nand, req, AmlogicSession, Error, RAM_SCRATCH};
+use amlogic::{AmlogicSession, Error, RAM_SCRATCH, nand, req};
 use amlogic::{MockTransport, Step};
 
 fn command(text: &str) -> Vec<u8> {
@@ -79,7 +79,10 @@ fn logical_read_uploads_region_once() {
     steps.extend(cmd("echo; nand read 0x1080000 0x280000 0x80000"));
     steps.extend(uploaded(0x80000, 0x41));
     let mut s = session(steps);
-    assert_eq!(read(&mut s, 0x280000, 0x80000, false).unwrap(), vec![0x41; 0x80000]);
+    assert_eq!(
+        read(&mut s, 0x280000, 0x80000, false).unwrap(),
+        vec![0x41; 0x80000]
+    );
     assert_eq!(s.transport().pos, s.transport().steps.len());
 }
 
@@ -94,7 +97,10 @@ fn nand_ranges_and_raw_alignment_are_checked_before_usb() {
     ] {
         let mut s = session(vec![]);
         let result = read(&mut s, offset, len, raw);
-        assert!(matches!(result, Err(Error::InvalidArgument(_))), "{offset} {len} {raw}");
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{offset} {len} {raw}"
+        );
         assert_eq!(s.transport().pos, 0);
     }
 }
@@ -118,9 +124,7 @@ fn unchanged_sentinel_is_not_a_nand_capture() {
     steps.extend(uploaded(2112, 0xa5));
     let mut s = session(steps);
     let mut out = Vec::new();
-    assert!(s
-        .read_nand_range(0, 2048, true, &mut out, &|_| {})
-        .is_err());
+    assert!(s.read_nand_range(0, 2048, true, &mut out, &|_| {}).is_err());
     assert!(out.is_empty());
     assert_eq!(s.transport().pos, s.transport().steps.len());
 }
@@ -153,7 +157,10 @@ fn long_read_splits_into_stages_with_keepalive() {
     let mut steps = Vec::new();
     // stage 1: full READ_STAGE_MAIN
     steps.extend(id());
-    steps.extend(cmd(&format!("echo; mw.b {RAM_SCRATCH:#x} 0xa5 {:#x}", nand::READ_STAGE_MAIN)));
+    steps.extend(cmd(&format!(
+        "echo; mw.b {RAM_SCRATCH:#x} 0xa5 {:#x}",
+        nand::READ_STAGE_MAIN
+    )));
     steps.extend(cmd(&format!(
         "echo; nand read {RAM_SCRATCH:#x} 0x0 {:#x}",
         nand::READ_STAGE_MAIN
@@ -171,12 +178,13 @@ fn long_read_splits_into_stages_with_keepalive() {
     let mut out = Vec::new();
     let progress = std::cell::RefCell::new(Vec::new());
     let n = s
-        .read_nand_range(0, len, false, &mut out, &|p| {
-            progress.borrow_mut().push(p)
-        })
+        .read_nand_range(0, len, false, &mut out, &|p| progress.borrow_mut().push(p))
         .unwrap();
     assert_eq!(n as u64, len as u64);
-    assert_eq!(out[..nand::READ_STAGE_MAIN].to_vec(), vec![0x11; nand::READ_STAGE_MAIN]);
+    assert_eq!(
+        out[..nand::READ_STAGE_MAIN].to_vec(),
+        vec![0x11; nand::READ_STAGE_MAIN]
+    );
     assert_eq!(&out[nand::READ_STAGE_MAIN..], &vec![0x22; 0x10_0000][..]);
     // per-stage progress
     assert_eq!(
@@ -191,7 +199,10 @@ fn long_read_splits_into_stages_with_keepalive() {
 #[test]
 fn transport_death_keeps_received_prefix() {
     let mut steps = id();
-    steps.extend(cmd(&format!("echo; mw.b {RAM_SCRATCH:#x} 0xa5 {:#x}", nand::READ_STAGE_MAIN)));
+    steps.extend(cmd(&format!(
+        "echo; mw.b {RAM_SCRATCH:#x} 0xa5 {:#x}",
+        nand::READ_STAGE_MAIN
+    )));
     steps.extend(cmd(&format!(
         "echo; nand read {RAM_SCRATCH:#x} 0x0 {:#x}",
         nand::READ_STAGE_MAIN

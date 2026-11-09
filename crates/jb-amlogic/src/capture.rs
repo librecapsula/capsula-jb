@@ -22,13 +22,21 @@
 //! no GPT — the DTB is the partition table.
 //!
 //! The manifest (`manifest.json`, schema 2) authenticates the stored
-//! files and keeps the layout taken from the device; the directory
-//! format is `backup/amlogic-<time>-<pid>-<n>/`, every run gets its
-//! own directory.
+//! files and keeps the layout taken from the device. The directory
+//! layout mirrors the rockchip backup: numbered partition images
+//! `NN_<name>.img` (by the position in the normal-partition order),
+//! the raw partition-table evidence (`device.dtb` — the Mini has no
+//! GPT, the DTB IS the table) plus the human-readable
+//! `partition_table.tsv` in the rockchip GPT tsv shape (idx, name,
+//! first LBA, sectors — the offsets are page-aligned, so the 512-byte
+//! units are exact), the identity files (env.txt / env-export.bin),
+//! the AML-reserved areas (captured but never flashed back) and the
+//! unified `backup.json` published at completion. There is NO raw
+//! NAND dump: nothing consumes it and it doubles the capture.
 
-use amlogic::{fdt, nand, AmlogicSession, Transport};
-use anyhow::{bail, ensure, Context};
-use jb_core::backup_store::{file_sha256, safe_capture_name, CaptureDirectory};
+use amlogic::{AmlogicSession, Transport, fdt, nand};
+use anyhow::{Context, bail, ensure};
+use jb_core::backup_store::{BackupStore, CaptureDirectory, file_sha256, safe_capture_name};
 use jb_core::progress::{Progress, ProgressFn};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -40,6 +48,38 @@ use std::path::{Path, PathBuf};
 pub const NORMAL_PARTITIONS: &[&str] = &[
     "tpl", "misc", "boot_a", "boot_b", "system_a", "system_b", "data",
 ];
+
+/// The image file name of a partition — the rockchip layout
+/// (`NN_<name>.img`), numbered by the position in the layout order
+/// (the known map `amlogic::PARTITIONS`, which the device map is
+/// validated against; bootloader is 01, data is the last).
+pub fn image_file(partition: &str) -> String {
+    let idx = amlogic::PARTITIONS
+        .iter()
+        .position(|(n, _, _)| *n == partition)
+        .unwrap_or_else(|| panic!("неизвестный раздел {partition}")) as u32
+        + 1;
+    BackupStore::image_name(idx, partition)
+}
+
+/// The human-readable partition table in the rockchip GPT tsv shape:
+/// `idx \t name \t first_lba \t sectors` (512-byte units; the NAND
+/// offsets and sizes are page-multiples, so the division is exact).
+/// Like rockchip's, this is the device truth (the DTB layout), not
+/// the captured logical sizes — those live in the manifest.
+fn layout_tsv(layout: &Layout) -> String {
+    let mut out = String::new();
+    for (i, (name, off, size)) in layout.partitions.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            i + 1,
+            name,
+            off / 512,
+            size / 512
+        ));
+    }
+    out
+}
 
 /// Size of fip/bootloader on the known platform (the platform gate).
 pub const FIP_SIZE: u32 = 0x20_0000;
@@ -382,16 +422,126 @@ pub enum OpenedCapture {
     Done(BackupReport),
 }
 
-/// Open (or create) the backup directory by serial — as with rockchip:
-/// `backup/<deviceid>/`. The environment is read from the device
-/// exactly once per run (the caller passes it here) and is written
-/// into the directory right away, so `drive()` skips that step.
-/// Behavior with an existing directory:
+/// Read-only peek at `backup/<deviceid>/` for a UI: the manifest
+/// status, WITHOUT any verification or directory creation. None = no
+/// capture directory (or an unreadable manifest — the same "nothing to
+/// show" for an idle screen; the real open path reports the details).
+pub fn peek_status(parent: &Path, deviceid: &str) -> Option<(PathBuf, Status)> {
+    let dir = parent.join(deviceid);
+    let m: Manifest =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).ok()?).ok()?;
+    Some((dir, m.status))
+}
+
+/// The v2 role of a non-partition capture file.
+fn v2_role(file: &str) -> &'static str {
+    if file.starts_with("reserved-") {
+        "reserved"
+    } else {
+        match file {
+            "env-export.bin" => "env",
+            "env.txt" => "env-text",
+            "device.dtb" => "dtb",
+            "partition_table.tsv" => "partition-table",
+            _ => "other",
+        }
+    }
+}
+
+/// Is this a numbered partition image (`NN_<name>.img` of a known
+/// partition)? Returns the partition name.
+fn partition_of_image(file: &str) -> Option<&'static str> {
+    let stem = file.strip_suffix(".img")?;
+    let (_, name) = stem.split_once('_')?;
+    amlogic::PARTITIONS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(n, _, _)| *n)
+}
+
+/// Publish the unified v2 backup manifest (`backup.json`,
+/// [`jb_core::backup_catalog`]) for a FINISHED capture, built from the
+/// schema-2 `manifest.json` — the checksums are already there, nothing
+/// is re-hashed. Idempotent: an existing v2 manifest is returned as-is.
+pub fn publish_v2(path: &Path) -> anyhow::Result<Option<jb_core::backup_catalog::BackupEntry>> {
+    use jb_core::backup_catalog as catalog;
+    if path.join(catalog::MANIFEST).is_file() {
+        return Ok(catalog::read(path));
+    }
+    let m: Manifest = serde_json::from_slice(&std::fs::read(path.join("manifest.json"))?)
+        .context("манифест захвата не читается")?;
+    anyhow::ensure!(
+        matches!(m.status, Status::Complete | Status::Warnings),
+        "v2 публикуется только для завершённого захвата (сейчас {:?})",
+        m.status
+    );
+    let mut images = Vec::new();
+    let mut extras = Vec::new();
+    for f in &m.files {
+        let partition = partition_of_image(&f.name);
+        match partition {
+            Some(p) => images.push(catalog::ImageEntry {
+                partition: p.to_string(),
+                file: f.name.clone(),
+                sha256: f.sha256.clone(),
+                size: f.actual,
+                // an under-read partition (bad blocks) is noted
+                complete: f.actual == f.expected,
+            }),
+            _ => extras.push(catalog::FileEntry {
+                file: f.name.clone(),
+                sha256: f.sha256.clone(),
+                size: f.actual,
+                role: v2_role(&f.name).to_string(),
+            }),
+        }
+    }
+    let shortened: Vec<String> = images
+        .iter()
+        .filter(|i| !i.complete)
+        .map(|i| i.partition.clone())
+        .collect();
+    let (status, notes) = if m.status == Status::Complete {
+        (catalog::Status::Complete, vec![])
+    } else {
+        (
+            catalog::Status::Partial,
+            vec![format!(
+                "захват с укороченными разделами (бед-блоки): {}",
+                shortened.join(", ")
+            )],
+        )
+    };
+    let manifest = catalog::BackupManifest {
+        format: catalog::FORMAT,
+        model: jb_core::session::Model::CapsuleMini,
+        key: path
+            .file_name()
+            .map(|k| k.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        created_utc: jb_core::format::utc_now_iso(),
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        status,
+        notes,
+        images,
+        extras,
+    };
+    Ok(Some(catalog::publish(path, manifest)?))
+}
+
+/// Open (or create) the backup directory by deviceid — the per-model
+/// v2 layout is the caller's business (`backup/capsule-mini/<id>/`).
+/// The environment is read from the device exactly once per run (the
+/// caller passes it here) and is written into the directory right
+/// away, so `drive()` skips that step. Behavior with an existing
+/// directory:
 /// - a full and verified capture — [`OpenedCapture::Done`];
 /// - unfinished (`Running`) — continues from the checkpoint; the
 ///   environment in the directory is checked against the deviceid of
 ///   the freshly read one (someone else's directory is refused —
 ///   continuing someone else's capture is not allowed);
+/// - an old-format capture (plain `<partition>.bin` names, the raw
+///   NAND dump) — refused: no migration, the backup is re-taken;
 /// - `Failed` or an unreadable manifest — refusal, sort it out
 ///   manually.
 pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapture> {
@@ -406,6 +556,25 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
         save_manifest(&dir, &m)?;
         return Ok(OpenedCapture::Run(dir.path().into()));
     }
+    // a pre-v2 capture (files named <partition>.bin / the raw NAND
+    // dump): not migrated — the backup is simpler to re-take
+    let legacy_names: Vec<String> = ["nand-full.raw.bin".to_string()]
+        .into_iter()
+        .chain(
+            amlogic::PARTITIONS
+                .iter()
+                .map(|(n, _, _)| format!("{n}.bin")),
+        )
+        .collect();
+    let legacy_marker = legacy_names
+        .iter()
+        .any(|n| dir_path.join(n).is_file() || dir_path.join(format!("{n}.partial")).is_file());
+    ensure!(
+        !legacy_marker,
+        "каталог {} — захват старого формата (v1); миграции нет, \
+         удалите каталог, чтобы снять бэкап заново",
+        dir_path.display()
+    );
     // the directory already exists — parse its state
     let mp = dir_path.join("manifest.json");
     ensure!(
@@ -423,7 +592,15 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
         m.schema
     );
     match m.status {
-        Status::Complete | Status::Warnings => Ok(OpenedCapture::Done(verify(&dir_path)?)),
+        Status::Complete | Status::Warnings => {
+            let report = verify(&dir_path)?;
+            // a capture finished by an older build has no v2 manifest
+            // yet — publish it from the verified schema-2 one (instant)
+            if !dir_path.join(jb_core::backup_catalog::MANIFEST).is_file() {
+                publish_v2(&dir_path).context("публикация backup.json")?;
+            }
+            Ok(OpenedCapture::Done(report))
+        }
         Status::Failed => bail!(
             "прошлый захват в {} завершился ошибкой ({}) — разберитесь и \
              удалите каталог, чтобы начать заново",
@@ -498,6 +675,8 @@ pub fn capture_pass<T: Transport>(
                 .collect::<String>();
             dir.write_file("SHA256SUMS.txt", sums.as_bytes())?;
             save_manifest(&dir, &m)?;
+            // the unified v2 publication — the last step of a capture
+            publish_v2(dir.path()).context("публикация backup.json")?;
             Ok(Pass::Done(BackupReport {
                 path: dir.path().into(),
                 status: m.status,
@@ -619,17 +798,16 @@ fn environment_text(raw: &[u8]) -> anyhow::Result<&str> {
 /// first one whose `imgread dtb` answers.
 fn dtb_slots(env_text: Option<&str>) -> Vec<&'static str> {
     let mut slots: Vec<&'static str> = Vec::new();
-    if let Some(text) = env_text {
-        if let Some(slot) = text
+    if let Some(text) = env_text
+        && let Some(slot) = text
             .lines()
             .find_map(|l| l.strip_prefix("boot_part="))
             .map(str::trim)
-        {
-            if slot == "boot_a" {
-                slots.push("boot_a");
-            } else if slot == "boot_b" {
-                slots.push("boot_b");
-            }
+    {
+        if slot == "boot_a" {
+            slots.push("boot_a");
+        } else if slot == "boot_b" {
+            slots.push("boot_b");
         }
     }
     for s in ["boot_a", "boot_b"] {
@@ -669,11 +847,11 @@ fn capture_item(
     } = item;
     // Already complete (including "complete but not published" from
     // the previous window) — just publish.
-    if let Some(r) = find_record(m, base) {
-        if r.actual == r.expected {
-            record(dir, m, base, expected, physical).map_err(DriveError::Fatal)?;
-            return Ok(());
-        }
+    if let Some(r) = find_record(m, base)
+        && r.actual == r.expected
+    {
+        record(dir, m, base, expected, physical).map_err(DriveError::Fatal)?;
+        return Ok(());
     }
     let partial = format!("{base}.partial");
     let cur = partial_len(dir, &partial);
@@ -795,6 +973,14 @@ fn drive(
         })?;
         let layout = dev.layout(&blob).map_err(DriveError::fatal)?;
         bytes(dir, m, "device.dtb", &blob).map_err(DriveError::Fatal)?;
+        // the human-readable table, the rockchip GPT tsv shape
+        bytes(
+            dir,
+            m,
+            "partition_table.tsv",
+            layout_tsv(&layout).as_bytes(),
+        )
+        .map_err(DriveError::Fatal)?;
         m.layout = layout.to_records();
         m.nand_size = layout.nand_size;
         m.reserved = layout
@@ -815,9 +1001,10 @@ fn drive(
     };
 
     // 3. Partitions — by logical capacity (store size), resuming at
-    //    `nand read` offsets (u-boot skips bad blocks itself).
+    //    `nand read` offsets (u-boot skips bad blocks itself). The
+    //    files are numbered like the rockchip dump (NN_<name>.img).
     for (name, off, size) in &layout.partitions {
-        let base = format!("{name}.bin");
+        let base = image_file(name);
         let expected = match find_record(m, &base) {
             Some(r) => r.expected,
             None => {
@@ -854,7 +1041,8 @@ fn drive(
         )?;
     }
 
-    // 4. Reserved areas — by addresses (device-unique).
+    // 4. Reserved areas — by addresses (device-unique, never flashed
+    //    back).
     for (name, off, size) in &layout.reserved {
         let base = format!("reserved-{name}.bin");
         progress(Progress::Step(format!(
@@ -875,25 +1063,9 @@ fn drive(
             },
         )?;
     }
-
-    // 5. The full raw dump with OOB — page by page, resuming at page
-    //    boundaries.
-    let expected_raw = nand::raw_bytes(layout.nand_size).map_err(DriveError::fatal)? as u64;
-    progress(Progress::Step("Amlogic: полный сырой дамп NAND".into()));
-    capture_item(
-        dev,
-        dir,
-        m,
-        progress,
-        Item {
-            base: "nand-full.raw.bin",
-            label: "nand-full.raw.bin",
-            expected: expected_raw,
-            off: 0,
-            raw: true,
-            physical: None,
-        },
-    )?;
+    // No raw NAND dump: nothing consumes it (the restore writes the
+    // data partition, the base builds on it) and it doubles the
+    // capture time and size.
     Ok(())
 }
 
@@ -954,18 +1126,17 @@ fn validate(path: &Path, m: &Manifest) -> anyhow::Result<()> {
     let layout = Layout::from_records(&m.layout, &m.reserved, m.nand_size);
     let mut expected = std::collections::BTreeMap::new();
     expected.insert("env-export.bin".into(), (amlogic::ENV_SIZE as u64, false));
-    // The text export is produced locally and is bounded by the
-    // binary environment.
+    // The text export and the tsv are produced locally and are
+    // bounded by the binary environment / the layout.
     expected.insert("env.txt".into(), (0, false));
+    expected.insert("partition_table.tsv".into(), (0, false));
     expected.insert("device.dtb".into(), (blob.len() as u64, false));
     for (name, _, size) in &layout.partitions {
-        expected.insert(format!("{name}.bin"), (*size as u64, true));
+        expected.insert(image_file(name), (*size as u64, true));
     }
     for (name, _, size) in &layout.reserved {
         expected.insert(format!("reserved-{name}.bin"), (*size as u64, false));
     }
-    let raw_total = (m.nand_size / m.page_size) as u64 * (m.page_size + m.oob_size) as u64;
-    expected.insert("nand-full.raw.bin".into(), (raw_total, false));
     let mut short = false;
     for file in &m.files {
         safe_capture_name(&file.name)?;
@@ -978,6 +1149,10 @@ fn validate(path: &Path, m: &Manifest) -> anyhow::Result<()> {
                 file.expected < amlogic::ENV_SIZE as u64,
                 "переполнен текст окружения"
             );
+        } else if name == "partition_table.tsv" {
+            // a locally-generated rendering of the layout, bounded by
+            // the line count
+            ensure!(file.expected < 64 * 1024, "переполнена таблица разделов");
         } else if let Some(physical) = file.physical_size {
             ensure!(
                 can_short && physical == size && file.expected > 0 && file.expected <= physical,
@@ -1068,7 +1243,7 @@ mod tests {
                 self.u32(value.len() as u32);
                 self.u32(off);
                 self.st.extend_from_slice(value);
-                while self.st.len() % 4 != 0 {
+                while !self.st.len().is_multiple_of(4) {
                     self.st.push(0);
                 }
             }
@@ -1076,7 +1251,7 @@ mod tests {
                 self.u32(1); // FDT_BEGIN_NODE
                 self.st.extend_from_slice(name.as_bytes());
                 self.st.push(0);
-                while self.st.len() % 4 != 0 {
+                while !self.st.len().is_multiple_of(4) {
                     self.st.push(0);
                 }
             }
@@ -1321,8 +1496,7 @@ mod tests {
                 "read:64:false",
                 "size:data",
                 "read:72:false",
-                "read:8:false",
-                "read:0:true"
+                "read:8:false"
             ]
         );
         match verify(&report.path) {
@@ -1336,7 +1510,7 @@ mod tests {
                 );
             }
         }
-        std::fs::write(report.path.join("bootloader.bin"), b"corrupt!").unwrap();
+        std::fs::write(report.path.join("01_bootloader.img"), b"corrupt!").unwrap();
         assert!(verify(&report.path).is_err());
         std::fs::remove_dir_all(parent.path()).unwrap();
     }
@@ -1354,9 +1528,9 @@ mod tests {
             }
             Pass::Done(_) => panic!("обрыв не распознан"),
         }
-        assert!(!dir.join("bootloader.bin").exists());
+        assert!(!dir.join("01_bootloader.img").exists());
         assert_eq!(
-            std::fs::read(dir.join("bootloader.bin.partial")).unwrap(),
+            std::fs::read(dir.join("01_bootloader.img.partial")).unwrap(),
             vec![1; 3]
         );
         let m: Manifest =
@@ -1369,10 +1543,10 @@ mod tests {
             Pass::Done(report) => {
                 assert_eq!(report.status, Status::Complete);
                 assert_eq!(
-                    std::fs::read(report.path.join("bootloader.bin")).unwrap(),
+                    std::fs::read(report.path.join("01_bootloader.img")).unwrap(),
                     vec![1; 8]
                 );
-                assert!(!report.path.join("bootloader.bin.partial").exists());
+                assert!(!report.path.join("01_bootloader.img.partial").exists());
             }
             Pass::Interrupted(r) => panic!("докачка не завершилась: {r}"),
         }
@@ -1393,7 +1567,7 @@ mod tests {
         // partition is not published
         assert!(dir.join("env.txt").is_file());
         assert!(dir.join("device.dtb").is_file());
-        assert!(dir.join("bootloader.bin.partial").is_file());
+        assert!(dir.join("01_bootloader.img.partial").is_file());
         let m: Manifest =
             serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(m.status, Status::Running);
@@ -1415,12 +1589,12 @@ mod tests {
                     &std::fs::read(report.path.join("manifest.json")).unwrap(),
                 )
                 .unwrap();
-                let part = m.files.iter().find(|f| f.name == "tpl.bin").unwrap();
+                let part = m.files.iter().find(|f| f.name == "02_tpl.img").unwrap();
                 assert_eq!(part.expected, 6);
                 assert_eq!(part.actual, 6);
                 assert_eq!(part.physical_size, Some(16));
                 assert_eq!(
-                    std::fs::read(report.path.join("tpl.bin")).unwrap(),
+                    std::fs::read(report.path.join("02_tpl.img")).unwrap(),
                     vec![1; 6]
                 );
             }
@@ -1511,6 +1685,60 @@ mod tests {
         std::fs::remove_dir_all(parent.path()).unwrap();
     }
 
+    /// A finished capture publishes the unified v2 manifest, and the
+    /// catalog can read and verify it back.
+    #[test]
+    fn finished_capture_publishes_v2_catalog_entry() {
+        use jb_core::backup_catalog as catalog;
+        let parent = parent();
+        let dir = begin(&parent);
+        let mut dev = Fake::new();
+        match run_pass(&mut dev, &dir).unwrap() {
+            Pass::Done(_) => {}
+            Pass::Interrupted(r) => panic!("не прошло: {r}"),
+        }
+        // the real capture_pass publishes v2 at its finalize step; the
+        // test harness bypasses it, so publish explicitly here
+        let entry = publish_v2(&dir).unwrap().expect("v2 entry");
+        assert_eq!(entry.manifest.model, jb_core::session::Model::CapsuleMini);
+        assert_eq!(entry.manifest.status, catalog::Status::Complete);
+        assert_eq!(
+            entry.manifest.key,
+            dir.file_name().unwrap().to_string_lossy()
+        );
+        // every normal partition became an image, extras are not images
+        assert!(entry.manifest.images.iter().any(|i| i.partition == "data"));
+        assert!(
+            entry
+                .manifest
+                .images
+                .iter()
+                .any(|i| i.partition == "bootloader" && i.file == "01_bootloader.img")
+        );
+        assert!(
+            entry
+                .manifest
+                .extras
+                .iter()
+                .all(|x| partition_of_image(&x.file).is_none())
+        );
+        assert!(
+            entry
+                .manifest
+                .extras
+                .iter()
+                .any(|x| x.role == "partition-table")
+        );
+        // catalog roundtrip + verification
+        assert!(entry.verify().is_ok());
+        let back = catalog::read(&dir).expect("catalog read");
+        assert!(back.verify().is_ok());
+        // idempotent: a second publish returns the existing entry
+        let again = publish_v2(&dir).unwrap().expect("v2 entry again");
+        assert_eq!(again.dir, entry.dir);
+        std::fs::remove_dir_all(parent.path()).unwrap();
+    }
+
     /// The layout from the real platform's DTB: cumulative offsets,
     /// tpl/data at zero, the platform gate.
     #[test]
@@ -1593,7 +1821,7 @@ mod tests {
             self.u32(value.len() as u32);
             self.u32(off);
             self.st.extend_from_slice(value);
-            while self.st.len() % 4 != 0 {
+            while !self.st.len().is_multiple_of(4) {
                 self.st.push(0);
             }
         }
@@ -1601,7 +1829,7 @@ mod tests {
             self.u32(1);
             self.st.extend_from_slice(name.as_bytes());
             self.st.push(0);
-            while self.st.len() % 4 != 0 {
+            while !self.st.len().is_multiple_of(4) {
                 self.st.push(0);
             }
         }
@@ -1689,7 +1917,7 @@ mod tests {
             Pass::Interrupted(r) => panic!("не прошло: {r}"),
         }
         // reopening a finished directory — Done without capturing
-        let mut dev = Fake::new();
+        let dev = Fake::new();
         match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
             OpenedCapture::Done(report) => {
                 assert_eq!(report.status, Status::Complete);
@@ -1719,7 +1947,7 @@ mod tests {
             OpenedCapture::Done(_) => panic!("незавершённый каталог не Run"),
         };
         assert_eq!(dir, dir2);
-        assert!(dir2.join("bootloader.bin.partial").is_file());
+        assert!(dir2.join("01_bootloader.img.partial").is_file());
         let mut dev = Fake::new();
         match run_pass(&mut dev, &dir2).unwrap() {
             Pass::Done(report) => assert_eq!(report.status, Status::Complete),

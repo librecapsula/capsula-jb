@@ -14,9 +14,11 @@
 //! knows no transports and no platforms.
 
 pub mod backend;
+pub mod backup_catalog;
 pub mod backup_store;
 pub mod config;
 pub mod format;
 pub mod overlay;
 pub mod progress;
 pub mod scenario;
+pub mod session;

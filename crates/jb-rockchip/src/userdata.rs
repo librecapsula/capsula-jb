@@ -12,15 +12,17 @@
 //! userdata is not signed and can be rewritten freely — it is the only
 //! partition the tool writes.
 
+use ext4_lwext4::{Ext4Fs, FileBlockDevice, MkfsOptions, OpenFlags};
 use jb_core::overlay::{LAYOUT_DIRS, OverlayFile};
 use jb_core::progress::{Progress, ProgressFn};
-use ext4_lwext4::{Ext4Fs, FileBlockDevice, MkfsOptions, OpenFlags};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UserDataError {
     /// The dump did not mount as ext2/3/4 — raw or unknown format.
-    #[error("userdata не смонтировался как ext2/3/4: {0}.\n  если раздел на колонке не отформатирован — запустите с --format-userdata")]
+    #[error(
+        "userdata не смонтировался как ext2/3/4: {0}.\n  если раздел на колонке не отформатирован — запустите с --format-userdata"
+    )]
     NotExt(String),
     #[error("не хватает места в userdata: {0}")]
     NoSpace(String),
@@ -49,14 +51,13 @@ pub fn build_image(
     if out.parent().is_some() {
         std::fs::create_dir_all(out.parent().unwrap())?;
     }
-    if !fresh {
-        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(dump), std::fs::canonicalize(out)) {
-            if a == b {
-                return Err(UserDataError::NotExt(
-                    "пути дампа и результата совпадают — дамп не модифицируется".into(),
-                ));
-            }
-        }
+    if !fresh
+        && let (Ok(a), Ok(b)) = (std::fs::canonicalize(dump), std::fs::canonicalize(out))
+        && a == b
+    {
+        return Err(UserDataError::NotExt(
+            "пути дампа и результата совпадают — дамп не модифицируется".into(),
+        ));
     }
     let device = if fresh {
         progress(Progress::Step(format!(
@@ -133,17 +134,16 @@ fn mkdir_all(fs: &Ext4Fs, dir: &Path) -> Result<(), UserDataError> {
             other => {
                 return Err(UserDataError::NotExt(format!(
                     "неожидаемый путь: {other:?}"
-                )))
+                )));
             }
         };
         cur.push('/');
         cur.push_str(&comp);
-        if !fs.is_dir(&cur) {
-            if let Err(e) = fs.mkdir(&cur, 0o755) {
-                if !matches!(e, ext4_lwext4::Error::AlreadyExists(_)) {
-                    return Err(e.into());
-                }
-            }
+        if !fs.is_dir(&cur)
+            && let Err(e) = fs.mkdir(&cur, 0o755)
+            && !matches!(e, ext4_lwext4::Error::AlreadyExists(_))
+        {
+            return Err(e.into());
         }
     }
     Ok(())
@@ -268,7 +268,7 @@ mod tests {
             &out,
             true,
             8 * 1024 * 1024,
-            &overlay_files("unit-test".into()),
+            &overlay_files("unit-test".into(), true),
             &|_| {},
         )
         .expect("real adbd");

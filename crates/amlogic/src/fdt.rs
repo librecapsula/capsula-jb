@@ -42,7 +42,8 @@ impl Node {
 
 /// Device-side numbers are big-endian u32/u64 (FDT spec).
 pub fn be_u32(b: &[u8]) -> Option<u32> {
-    b.get(..4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+    b.get(..4)
+        .map(|s| u32::from_be_bytes(s.try_into().unwrap()))
 }
 
 /// 4-byte values read as u32, 8-byte as u64 (the DTB encodes both).
@@ -120,10 +121,14 @@ pub fn parse(data: &[u8]) -> Result<Node> {
     }
     let size_struct = word(36) as usize;
     if size_struct == 0 || off_struct + size_struct > data.len() {
-        return Err(Error::InvalidResponse("DTB: structure block вне блоба".into()));
+        return Err(Error::InvalidResponse(
+            "DTB: structure block вне блоба".into(),
+        ));
     }
     if off_strings >= data.len() || word(32) as usize > data.len() - off_strings {
-        return Err(Error::InvalidResponse("DTB: strings block вне блоба".into()));
+        return Err(Error::InvalidResponse(
+            "DTB: strings block вне блоба".into(),
+        ));
     }
     let strings = &data[off_strings..off_strings + word(32) as usize];
 
@@ -166,20 +171,28 @@ pub fn parse(data: &[u8]) -> Result<Node> {
                 let len = r.u32()? as usize;
                 let nameoff = r.u32()? as usize;
                 let Some(value) = r.data.get(r.pos..r.pos + len) else {
-                    return Err(Error::InvalidResponse("DTB: значение свойства обрезано".into()));
+                    return Err(Error::InvalidResponse(
+                        "DTB: значение свойства обрезано".into(),
+                    ));
                 };
                 r.pos += len;
                 r.pos = (r.pos + 3) & !3;
-                let Some(nul) = strings.get(nameoff..).and_then(|s| s.iter().position(|&b| b == 0))
+                let Some(nul) = strings
+                    .get(nameoff..)
+                    .and_then(|s| s.iter().position(|&b| b == 0))
                 else {
-                    return Err(Error::InvalidResponse("DTB: имя свойства вне strings".into()));
+                    return Err(Error::InvalidResponse(
+                        "DTB: имя свойства вне strings".into(),
+                    ));
                 };
                 let pname = String::from_utf8_lossy(&strings[nameoff..nameoff + nul]).into_owned();
                 let node = stack
                     .last_mut()
                     .ok_or_else(|| Error::InvalidResponse("DTB: свойство вне узла".into()))?;
                 if node.props.iter().any(|(n, _)| *n == pname) {
-                    return Err(Error::InvalidResponse(format!("DTB: повторное свойство {pname}")));
+                    return Err(Error::InvalidResponse(format!(
+                        "DTB: повторное свойство {pname}"
+                    )));
                 }
                 node.props.push((pname, value.to_vec()));
             }
@@ -209,9 +222,14 @@ pub fn parse(data: &[u8]) -> Result<Node> {
                 if !stack.is_empty() {
                     return Err(Error::InvalidResponse("DTB: незакрытые узлы".into()));
                 }
-                return root.ok_or_else(|| Error::InvalidResponse("DTB: нет корневого узла".into()));
+                return root
+                    .ok_or_else(|| Error::InvalidResponse("DTB: нет корневого узла".into()));
             }
-            t => return Err(Error::InvalidResponse(format!("DTB: неизвестный токен {t:#x}"))),
+            t => {
+                return Err(Error::InvalidResponse(format!(
+                    "DTB: неизвестный токен {t:#x}"
+                )));
+            }
         }
     }
 }
@@ -250,7 +268,7 @@ mod tests {
             self.u32(value.len() as u32);
             self.u32(off);
             self.st.extend_from_slice(value);
-            while self.st.len() % 4 != 0 {
+            while !self.st.len().is_multiple_of(4) {
                 self.st.push(0);
             }
         }
@@ -258,7 +276,7 @@ mod tests {
             self.u32(FDT_BEGIN_NODE);
             self.st.extend_from_slice(name.as_bytes());
             self.st.push(0);
-            while self.st.len() % 4 != 0 {
+            while !self.st.len().is_multiple_of(4) {
                 self.st.push(0);
             }
             self.depth += 1;
@@ -274,7 +292,8 @@ mod tests {
             let struct_off = header + rsvmap;
             let total = struct_off + self.st.len() + self.strings.len();
             let mut b = vec![0u8; total];
-            let put = |b: &mut [u8], n: usize, v: u32| b[n..n + 4].copy_from_slice(&v.to_be_bytes());
+            let put =
+                |b: &mut [u8], n: usize, v: u32| b[n..n + 4].copy_from_slice(&v.to_be_bytes());
             put(&mut b, 0, FDT_MAGIC);
             put(&mut b, 4, total as u32);
             put(&mut b, 8, struct_off as u32);
@@ -319,7 +338,10 @@ mod tests {
         let ctrl = root.child("nand-controller@7800").unwrap();
         assert_eq!(be_u32(ctrl.prop("fip_size").unwrap()), Some(0x20_0000));
         let parts = ctrl.child("nand_partition").unwrap();
-        assert_eq!(be_u32(parts.child("tpl").unwrap().prop("size").unwrap()), Some(0));
+        assert_eq!(
+            be_u32(parts.child("tpl").unwrap().prop("size").unwrap()),
+            Some(0)
+        );
         assert_eq!(
             be_u32(parts.child("data").unwrap().prop("size").unwrap()),
             Some(0x4e0_0000)
@@ -386,4 +408,3 @@ mod tests {
         assert!(parse(&blob).is_err(), "'/' в имени узла");
     }
 }
-

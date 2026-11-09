@@ -2,9 +2,9 @@
 //! device-mode enumeration.
 
 use crate::error::{Error, Result};
+use nusb::MaybeFuture;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, ControlOut, ControlType, Direction, Recipient, TransferError};
-use nusb::MaybeFuture;
 
 /// Snapshot of a Rockchip device present on the bus.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -287,10 +287,10 @@ pub fn device_serial(mode: &DeviceMode) -> Option<String> {
 pub fn list_modes() -> Result<Vec<DeviceMode>> {
     let mut modes: Vec<DeviceMode> = Vec::new();
     for d in nusb::list_devices().wait()? {
-        if let Some(m) = DeviceMode::from_bus(d.vendor_id(), d.product_id(), d.product_string()) {
-            if !modes.contains(&m) {
-                modes.push(m);
-            }
+        if let Some(m) = DeviceMode::from_bus(d.vendor_id(), d.product_id(), d.product_string())
+            && !modes.contains(&m)
+        {
+            modes.push(m);
         }
     }
     Ok(modes)

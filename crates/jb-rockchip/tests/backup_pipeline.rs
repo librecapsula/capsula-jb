@@ -3,10 +3,10 @@
 //! partition reads -> the directory layout (SHA256SUMS/SUCCESS/tsv) —
 //! no hardware involved.
 
-use jb_rockchip::backup::{backup, CHUNK_SECTORS, GUARD_LBA};
 use jb_core::config::Config;
+use jb_rockchip::backup::{CHUNK_SECTORS, GUARD_LBA, backup};
 use jb_rockchip::gpt;
-use rockusb::loader::{opcode, LoaderSession};
+use rockusb::loader::{LoaderSession, opcode};
 use rockusb::mock::{MockTransport, Step};
 use std::io::Write as _;
 
@@ -214,6 +214,22 @@ fn backup_pipeline_on_mock() {
     steps.push(Step::BulkIn(gpt_raw.clone()));
     steps.push(Step::BulkIn(csw(tag)));
 
+    // idblock: 4 sectors from LBA 0x40
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        4 * 512,
+        true,
+        10,
+        opcode::READ_LBA,
+        0,
+        0x40,
+        4,
+    )));
+    steps.push(Step::BulkIn(
+        flash[0x40 * 512..0x40 * 512 + 4 * 512].to_vec(),
+    ));
+    steps.push(Step::BulkIn(csw(tag)));
+
     // flash_detect again (for the report)
     steps.push(Step::BulkOut(cbw(
         t!(),
@@ -277,31 +293,54 @@ fn backup_pipeline_on_mock() {
     assert_eq!(report.sectors_total, READ_LIMIT as u64);
     assert_eq!(report.read_limit_old, Some(0x10000));
 
-    // the directory layout is compatible
+    // the directory layout
     let sec = std::fs::read(out.join("01_sec.img")).unwrap();
     assert_eq!(sec, &flash[512 * 512..512 * 513]);
     let data_img = std::fs::read(out.join("02_data.img")).unwrap();
     assert_eq!(data_img, &flash[513 * 512..516 * 512]);
     assert!(out.join(".gpt.bin").is_file());
+    // the idblock: 4 sectors at LBA 0x40, outside the GPT partitions
+    let idb = std::fs::read(out.join("idblock.bin")).unwrap();
+    assert_eq!(idb.len(), 4 * 512);
+    assert_eq!(idb, &flash[0x40 * 512..0x40 * 512 + 4 * 512]);
     let tsv = std::fs::read_to_string(out.join("partition_table.tsv")).unwrap();
     assert_eq!(tsv, "1\tsec\t512\t1\n2\tdata\t513\t3\n");
-    let sums = std::fs::read_to_string(out.join("SHA256SUMS.txt")).unwrap();
-    assert_eq!(sums.lines().count(), 2);
+    // the legacy completion markers are gone (v2-only)
+    assert!(!out.join("SHA256SUMS.txt").exists());
+    assert!(!out.join("SUCCESS.txt").exists());
+
+    // the report carries the streamed checksums of every image
+    assert_eq!(report.images.len(), 2);
+    assert!(report.masked.is_empty());
     let expected_sum = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(&sec);
         hex::encode(h.finalize())
     };
-    assert!(sums.starts_with(&format!("{expected_sum}  01_sec.img")));
-    assert!(std::fs::read_to_string(out.join("SUCCESS.txt"))
-        .unwrap()
-        .starts_with("SUCCESS: "));
+    let sec_entry = report.images.iter().find(|i| i.partition == "sec").unwrap();
+    assert_eq!(sec_entry.sha256, expected_sum);
+    assert_eq!(sec_entry.size, 512);
+    assert!(sec_entry.complete);
 
-    // BackupStore opens and verifies the result
-    let store = jb_core::backup_store::BackupStore::open(&out).unwrap();
-    store.verify().expect("verify");
-    assert!(store.find("sec").is_some());
+    // the caller publishes the v2 manifest and it verifies
+    let manifest = jb_core::backup_catalog::BackupManifest {
+        format: jb_core::backup_catalog::FORMAT,
+        model: jb_core::session::Model::Capsule,
+        key: "TESTSERIAL".into(),
+        created_utc: "2026-11-10T00:00:00Z".into(),
+        tool_version: "test".into(),
+        status: jb_core::backup_catalog::Status::Complete,
+        notes: vec![],
+        images: report.images.clone(),
+        extras: vec![],
+    };
+    let entry = jb_core::backup_catalog::publish(&out, manifest).unwrap();
+    entry.verify().expect("verify");
+    assert!(entry.image("data").is_some());
+    // and the catalog reads it back
+    let back = jb_core::backup_catalog::read(&out).unwrap();
+    assert!(back.verify().is_ok());
 
     // the GPT module parses the saved dump the same way
     let parsed = gpt::Gpt::parse(&std::fs::read(out.join(".gpt.bin")).unwrap()).unwrap();
@@ -377,8 +416,8 @@ fn backup_fails_on_cc_mask() {
     let mut s = LoaderSession::new(transport, EP_IN, EP_OUT);
     let out = std::env::temp_dir().join(format!("jb-cc-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
-    let err = backup(&mut s, &test_config(), &out, &|_| {}, false)
-        .expect_err("the mask must be caught");
+    let err =
+        backup(&mut s, &test_config(), &out, &|_| {}, false).expect_err("the mask must be caught");
     assert!(err.to_string().contains("0xCC"), "{err}");
     let _ = std::fs::remove_dir_all(&out);
 }
@@ -387,9 +426,9 @@ fn backup_fails_on_cc_mask() {
 /// progress bar must move during a long userdata flash).
 #[test]
 fn write_partition_is_chunked_with_progress() {
+    use jb_core::progress::Progress;
     use jb_rockchip::flash::write_partition_padded;
     use jb_rockchip::gpt::{Gpt, GptEntry};
-    use jb_core::progress::Progress;
 
     let total = CHUNK_SECTORS as u64 + 3;
     let gpt = Gpt {
@@ -478,7 +517,7 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
 
     const GUARD: u64 = GUARD_LBA as u64;
     let entries = [
-        ("low", 512, 514),             // fully below the mask
+        ("low", 512, 514),                  // fully below the mask
         ("straddle", GUARD - 2, GUARD + 1), // crosses GUARD like boot_b
         ("high", GUARD + 16, GUARD + 17),   // fully above the mask
     ];
@@ -512,6 +551,22 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
         34,
     )));
     steps.push(Step::BulkIn(gpt_raw.clone()));
+    steps.push(Step::BulkIn(csw(tag)));
+
+    // idblock: 4 sectors from LBA 0x40 (below the mask — real content)
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        4 * 512,
+        true,
+        10,
+        opcode::READ_LBA,
+        0,
+        0x40,
+        4,
+    )));
+    steps.push(Step::BulkIn(
+        [real(0x40), real(0x41), real(0x42), real(0x43)].concat(),
+    ));
     steps.push(Step::BulkIn(csw(tag)));
 
     // flash_detect (for the report)
@@ -594,22 +649,32 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
 
     // every partition is dumped full-size with what the device returned
     assert_eq!(std::fs::read(out.join("01_low.img")).unwrap(), low_reply);
-    assert_eq!(std::fs::read(out.join("02_straddle.img")).unwrap(), straddle_reply);
-    assert_eq!(std::fs::read(out.join("03_high.img")).unwrap(), high_reply);
     assert_eq!(
-        std::fs::read_to_string(out.join("SHA256SUMS.txt"))
-            .unwrap()
-            .lines()
-            .count(),
-        3
+        std::fs::read(out.join("02_straddle.img")).unwrap(),
+        straddle_reply
     );
-    assert!(std::fs::read_to_string(out.join("SUCCESS.txt"))
-        .unwrap()
-        .starts_with("SUCCESS: "));
-    jb_core::backup_store::BackupStore::open(&out)
-        .unwrap()
-        .verify()
-        .expect("verify");
+    assert_eq!(std::fs::read(out.join("03_high.img")).unwrap(), high_reply);
+    // the idblock is below the mask — real content even on the stock
+    // loader
+    assert_eq!(
+        std::fs::read(out.join("idblock.bin")).unwrap(),
+        [real(0x40), real(0x41), real(0x42), real(0x43)].concat()
+    );
+    // straddle and high are flagged not-intact in the report, low is
+    // not; the caller seals that into a partial v2 manifest
+    assert_eq!(
+        report.masked,
+        vec!["straddle".to_string(), "high".to_string()]
+    );
+    for (partition, complete) in [("low", true), ("straddle", false), ("high", false)] {
+        let img = report
+            .images
+            .iter()
+            .find(|i| i.partition == partition)
+            .unwrap();
+        assert_eq!(img.complete, complete, "{partition}");
+        assert!(img.size > 0);
+    }
 
     // straddle and high are flagged, low is not; the run ends with the
     // NOT-intact warning naming both
@@ -628,9 +693,11 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
             .count(),
         2
     );
-    assert!(step_msgs
-        .iter()
-        .any(|m| m.contains("НЕцелостный") && m.contains("straddle") && m.contains("high")));
+    assert!(
+        step_msgs
+            .iter()
+            .any(|m| m.contains("НЕцелостный") && m.contains("straddle") && m.contains("high"))
+    );
 
     let _ = std::fs::remove_dir_all(&out);
 }

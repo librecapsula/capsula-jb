@@ -7,11 +7,11 @@
 /// for the media (download) transfers and by the tooling around them.
 pub fn add_sum(data: &[u8]) -> u32 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(4);
-    for c in &mut chunks {
-        sum = sum.wrapping_add(u32::from_le_bytes(c.try_into().unwrap()));
+    let (chunks, rest) = data.as_chunks::<4>();
+    for c in chunks {
+        sum = sum.wrapping_add(u32::from_le_bytes(*c));
     }
-    match chunks.remainder() {
+    match rest {
         [a] => sum.wrapping_add(*a as u32),
         [a, b] => sum.wrapping_add(u16::from_le_bytes([*a, *b]) as u32),
         [a, b, c] => sum.wrapping_add((*a as u32) | ((*b as u32) << 8) | ((*c as u32) << 16)),

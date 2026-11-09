@@ -15,15 +15,7 @@ use std::io::Write;
 /// before any output.
 pub fn init() {
     let inner = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} {:<5} {}",
-                ts_ms(),
-                record.level(),
-                record.args()
-            )
-        })
+        .format(|buf, record| writeln!(buf, "{} {:<5} {}", ts_ms(), record.level(), record.args()))
         .target(env_logger::Target::Stdout)
         .build();
     log::set_max_level(inner.filter());

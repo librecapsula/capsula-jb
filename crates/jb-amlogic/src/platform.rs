@@ -17,15 +17,16 @@
 
 use crate::capture::{self, BackupReport, OpenedCapture, Pass, Status};
 use crate::env;
-use crate::write::{write_data_pass, WriteState};
+use crate::write::{WriteState, write_data_pass};
 use amlogic::{AmlogicSession, NusbTransport};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use jb_core::backend::Backend;
 use jb_core::config::Config;
 use jb_core::format::humansize;
 use jb_core::overlay::OverlayFile;
 use jb_core::progress::ProgressFn;
-use jb_core::scenario::{self, Params, Platform, Prepared};
+use jb_core::scenario::{BackupState, Platform, Prepared, RestoreItem};
+use jb_core::session::{Identity, Model};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -49,7 +50,9 @@ const REBOOT_WAIT: Duration = Duration::from_secs(30);
 /// cable/driver problem, not "too little time".
 const MAX_STALLED_WINDOWS: u32 = 3;
 
-/// Bytes of capture on disk (for the treading-water detection).
+/// Bytes of capture on disk (for the treading-water detection):
+/// partition images (.img), reserved areas (.bin), checkpoints
+/// (.partial) and the environment.
 fn captured_bytes(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
         .map(|rd| {
@@ -57,12 +60,40 @@ fn captured_bytes(dir: &Path) -> u64 {
                 .filter(|e| {
                     let n = e.file_name();
                     let n = n.to_string_lossy();
-                    n.ends_with(".bin") || n.ends_with(".partial") || n == "env.txt"
+                    n.ends_with(".bin")
+                        || n.ends_with(".img")
+                        || n.ends_with(".partial")
+                        || n == "env.txt"
                 })
                 .filter_map(|e| e.metadata().ok().map(|m| m.len()))
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// Read the u-boot environment over a fresh session (the identity
+/// read). A session death at this step is a normal re-entry — this is
+/// still only the first window — so up to three attempts with a
+/// reconnect in between. Returns the (possibly re-entered) session and
+/// the raw environment bytes.
+fn capture_env(
+    mut s: AmlogicSession<NusbTransport>,
+    progress: &dyn Fn(jb_core::progress::Progress),
+) -> Result<(AmlogicSession<NusbTransport>, Vec<u8>)> {
+    let mut attempts = 0;
+    loop {
+        match env::capture_env_raw(&mut s) {
+            Ok(raw) => return Ok((s, raw)),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 3 {
+                    return Err(e).context("съём окружения (identity)");
+                }
+                log::warn!("съём окружения не удался ({e:#}) — перезаход в окно");
+                s = reconnect_window(s, progress)?;
+            }
+        }
+    }
 }
 
 /// Re-enter the window: a warm cycle does not re-raise the gadget
@@ -99,14 +130,17 @@ fn manual_reconnect(
 
 /// The identity read from the u-boot environment keys the capture
 /// directory; the environment is read from the device exactly once per
-/// run (before the directory opens) and recorded into the capture, so
-/// a resume after a tool restart keeps the same directory. A directory
-/// holding someone else's environment is rejected
-/// (`capture::open_or_start`).
+/// run (at connect, before the directory opens) and is recorded into
+/// the capture, so a resume after a tool restart keeps the same
+/// directory. A directory holding someone else's environment is
+/// rejected (`capture::open_or_start`).
 pub struct Amlogic {
     config: Config,
     session: Option<AmlogicSession<NusbTransport>>,
-    /// The capture directory and its status after prepare (the
+    /// The environment bytes read at connect — the identity source and
+    /// the input of `capture::open_or_start`.
+    env_raw: Option<Vec<u8>>,
+    /// The capture directory and its status after ensure_backup (the
     /// data-size gate and the backup-only report read it).
     capture: Option<(PathBuf, Status)>,
     wait: Option<Duration>,
@@ -117,6 +151,7 @@ impl Amlogic {
         Amlogic {
             config: Config::embedded(),
             session: None,
+            env_raw: None,
             capture: None,
             wait: None,
         }
@@ -150,45 +185,39 @@ impl Backend for Amlogic {
         Some(&self.config.hint.amlogic_text)
     }
 
-    fn jailbreak(
-        &mut self,
-        params: &Params,
-        confirm: jb_core::scenario::Confirm,
-        progress: ProgressFn,
-    ) -> Result<()> {
-        scenario::jailbreak(self, params, confirm, progress)
+    fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
+        self.wait = wait;
+        self.capture = None;
+        self.env_raw = None;
+        let s = bring_up(wait, progress)?;
+        // identity: the environment before anything else; a session
+        // death at this step is a normal re-entry, this is still only
+        // the first window
+        let (s, env_raw) = capture_env(s, progress)?;
+        let deviceid = capture::device_id(&env_raw).context("съём окружения (identity)")?;
+        log::info!("deviceid колонки: {deviceid}");
+        self.session = Some(s);
+        self.env_raw = Some(env_raw);
+        Ok(Identity {
+            model: Model::CapsuleMini,
+            key: deviceid,
+            firstgen: false,
+            caveats: vec![],
+        })
     }
 
-    fn backup(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<()> {
-        scenario::backup(self, wait, progress)
-    }
-
-    fn restore(
-        &mut self,
-        wait: Option<Duration>,
-        confirm: jb_core::scenario::Confirm,
-        progress: ProgressFn,
-    ) -> Result<()> {
-        scenario::restore(self, wait, confirm, progress)
+    fn platform(&mut self) -> &mut dyn Platform {
+        self
     }
 }
 
 impl Platform for Amlogic {
-    fn prepare(
-        &mut self,
-        no_backup: bool,
-        wait: Option<Duration>,
-        progress: ProgressFn,
-    ) -> Result<Prepared> {
-        self.wait = wait;
-        self.capture = None;
+    fn ensure_backup(&mut self, no_backup: bool, progress: ProgressFn) -> Result<Prepared> {
         if no_backup {
             log::info!(
                 "--no-backup: бэкап не снимаю — data будет собран с нуля, \
                  текущее содержимое теряется"
             );
-            let s = bring_up(wait, progress)?;
-            self.session = Some(s);
             return Ok(Prepared {
                 base: None,
                 dumped: false,
@@ -196,33 +225,16 @@ impl Platform for Amlogic {
                 complete: false,
             });
         }
+        let env_raw = self
+            .env_raw
+            .clone()
+            .ok_or_else(|| anyhow!("устройство не подключено"))?;
+        let mut s = self
+            .session
+            .take()
+            .ok_or_else(|| anyhow!("устройство не подключено"))?;
 
-        let mut s = match self.session.take() {
-            Some(s) => s,
-            None => bring_up(wait, progress)?,
-        };
-
-        // identity: the environment before the directory; a session
-        // death at this step is a normal re-entry, this is still only
-        // the first window
-        let env_raw = {
-            let mut attempts = 0;
-            loop {
-                match env::capture_env_raw(&mut s) {
-                    Ok(env) => break env,
-                    Err(e) => {
-                        attempts += 1;
-                        if attempts >= 3 {
-                            self.session = Some(s);
-                            return Err(e).context("съём окружения (identity)");
-                        }
-                        log::warn!("съём окружения не удался ({e:#}) — перезаход в окно");
-                        s = reconnect_window(s, progress)?;
-                    }
-                }
-            }
-        };
-        let dir = match capture::open_or_start(Path::new("backup"), &env_raw)
+        let dir = match capture::open_or_start(&backup_root(), &env_raw)
             .context("каталог захвата Amlogic")?
         {
             OpenedCapture::Done(report) => {
@@ -281,21 +293,57 @@ impl Platform for Amlogic {
         }
     }
 
+    fn backup_state(&self) -> BackupState {
+        let Some(env_raw) = &self.env_raw else {
+            return BackupState::None;
+        };
+        let Ok(deviceid) = capture::device_id(env_raw) else {
+            return BackupState::None;
+        };
+        // The v2 manifest metadata first (no hashing here — the
+        // checksum pass runs in ensure_backup); unfinished directories
+        // are surfaced through the schema-2 checkpoint status.
+        match jb_core::backup_catalog::open(Path::new("backup"), Model::CapsuleMini, &deviceid) {
+            Some(e) if e.manifest.status == jb_core::backup_catalog::Status::Complete => {
+                BackupState::Verified { dir: e.dir }
+            }
+            Some(e) => BackupState::Unusable {
+                dir: e.dir,
+                why: if e.manifest.notes.is_empty() {
+                    vec!["захват снят с оговорками".into()]
+                } else {
+                    e.manifest.notes
+                },
+            },
+            None => match capture::peek_status(&backup_root(), &deviceid) {
+                Some((dir, Status::Running)) => BackupState::Unusable {
+                    dir,
+                    why: vec!["захват не завершён — продолжится при следующей операции".into()],
+                },
+                Some((dir, Status::Failed)) => BackupState::Unusable {
+                    dir,
+                    why: vec!["прошлый захват упал — удалите каталог".into()],
+                },
+                _ => BackupState::None,
+            },
+        }
+    }
+
     fn data_size(&mut self, _progress: ProgressFn) -> Result<u64> {
         // The jailbreak-only base gate: a capture with bad blocks that
         // lost the data partition cannot become the base of a new
         // image. The backup-only flow tolerates it (report_backup says
         // so), so the gate lives here, not in prepare.
-        if let Some((path, Status::Warnings)) = &self.capture {
-            if !path.join("data.bin").is_file() {
-                bail!(
-                    "раздел data прочитан не полностью (бед-блоки) — \
+        if let Some((path, Status::Warnings)) = &self.capture
+            && !path.join(capture::image_file("data")).is_file()
+        {
+            bail!(
+                "раздел data прочитан не полностью (бед-блоки) — \
                      строить образ поверх неполного дампа нельзя. \
                      Повторите запуск (бед-блок может уйти с перечётом \
                      логической ёмкости) или используйте \
                      --format-userdata/--no-backup"
-                );
-            }
+            );
         }
         let s = self
             .session
@@ -322,8 +370,9 @@ impl Platform for Amlogic {
     }
 
     fn describe_restore(&self) -> String {
-        "data из верифицированного захвата — оверлей джейлбрейка и всё, \
-         что записано после захвата, будет затёрто"
+        "все целые разделы из верифицированного захвата (AML-reserved и \
+         окружение device-уникальны и не прошиваются) — оверлей \
+         джейлбрейка и всё, что записано после захвата, будет затёрто"
             .into()
     }
 
@@ -340,77 +389,53 @@ impl Platform for Amlogic {
     }
 
     fn write_data_image(&mut self, image: &Path, progress: ProgressFn) -> Result<()> {
-        let mut s = self
-            .session
-            .take()
-            .ok_or_else(|| anyhow!("устройство не поднято"))?;
-        let (_, data_off, data_physical) =
-            amlogic::partition("data").ok_or_else(|| anyhow!("в карте разделов нет data"))?;
-        let image_len = std::fs::metadata(image)?.len() as usize;
-        let mut file = std::fs::File::open(image)?;
-        log::info!(
-            "запись data: {} ({})",
-            humansize(image_len as u64),
-            image.display()
-        );
-        progress(jb_core::progress::Progress::TransferStart {
-            name: "data".into(),
-            bytes: image_len as u64,
-        });
-        // The chunked write between windows — one `download store` of
-        // the whole partition does not fit a healthy board's window,
-        // just like the capture. The erase always covers the full
-        // PHYSICAL partition range: the erase arithmetic of u-boot is
-        // physical while the write arithmetic is logical (bad blocks
-        // skipped), and a stale tail PEB with an old image sequence
-        // number makes UBI refuse the whole partition (the stock system
-        // then reformats it and drops into factory mode).
-        let mut st = WriteState::fresh();
-        let mut last = 0usize;
-        let mut stalls = 0u32;
-        loop {
-            let done = write_data_pass(
-                &mut s,
-                &mut file,
-                data_off,
-                data_physical,
-                image_len,
-                &mut st,
-                &|done| {
-                    progress(jb_core::progress::Progress::TransferProgress {
-                        name: "data".into(),
-                        done: done as u64,
-                        total: image_len as u64,
-                    });
-                },
-            )
-            .context("проход записи data")?;
-            if done {
-                break;
+        self.write_partition_windowed("data", image, progress)
+    }
+
+    fn restore_set(&mut self) -> Result<(Vec<RestoreItem>, Vec<String>)> {
+        let env_raw = self
+            .env_raw
+            .clone()
+            .ok_or_else(|| anyhow!("устройство не подключено"))?;
+        let deviceid = capture::device_id(&env_raw)?;
+        let entry =
+            jb_core::backup_catalog::open(Path::new("backup"), Model::CapsuleMini, &deviceid)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "восстановление невозможно: нет верифицированного захвата {} \
+                     для этой колонки; сначала снимите его — capsula-jb backup",
+                        deviceid
+                    )
+                })?;
+        entry
+            .verify()
+            .context("захват не прошёл проверку SHA256 — снимите его заново")?;
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        for img in &entry.manifest.images {
+            // a shortened image (bad blocks) must not be flashed back:
+            // writing half a partition corrupts it
+            if img.complete {
+                items.push(RestoreItem {
+                    partition: img.partition.clone(),
+                    image: entry.dir.join(&img.file),
+                    size: img.size,
+                });
+            } else {
+                skipped.push(img.partition.clone());
             }
-            stalls = if st.written > last { 0 } else { stalls + 1 };
-            last = last.max(st.written);
-            if stalls >= MAX_STALLED_WINDOWS {
-                self.session = Some(s);
-                bail!(
-                    "окна идут, а запись стоит на месте ({}/{}): \
-                     проверьте кабель/плату",
-                    humansize(st.written as u64),
-                    humansize(image_len as u64)
-                );
-            }
-            log::info!(
-                "записано {} из {} — нужно свежее окно",
-                humansize(st.written as u64),
-                humansize(image_len as u64)
-            );
-            s = reconnect_window(s, progress)
-                .context("перезаход в окно после исчерпания записи")?;
         }
-        progress(jb_core::progress::Progress::TransferDone {
-            name: "data".into(),
-        });
-        self.session = Some(s);
+        Ok((items, skipped))
+    }
+
+    fn write_restore(&mut self, items: &[RestoreItem], progress: ProgressFn) -> Result<()> {
+        // In the layout-map order (bootloader first, data last); the
+        // device-unique AML-reserved areas and the environment are
+        // NEVER written (see the module docs) — that is why they are
+        // extras in the manifest, not images.
+        for item in items {
+            self.write_partition_windowed(&item.partition, &item.image, progress)?;
+        }
         Ok(())
     }
 
@@ -465,18 +490,117 @@ impl Platform for Amlogic {
     }
 }
 
-/// The capture's data partition as the patch base: published as
-/// data.bin only when fully read. A Warnings capture with a full
-/// data.bin still serves (short sections are bad blocks elsewhere);
-/// a missing data.bin yields None — the jailbreak-only gate in
-/// `data_size` then rejects the run.
+impl Amlogic {
+    /// The chunked partition write between power-cycle windows (the
+    /// jailbreak's data write and every partition of the full
+    /// restore): erase the full PHYSICAL range, write the image in
+    /// chunks with an identify-keepalive each, and on a window death
+    /// reconnect and restart the partition from scratch (the erase
+    /// always covers the whole range — see write.rs for the erase/write
+    /// arithmetic). A session death at a pass boundary surfaces as the
+    /// first failed keepalive/erase of the next pass — the same loop
+    /// handles it.
+    fn write_partition_windowed(
+        &mut self,
+        partition: &str,
+        image: &Path,
+        progress: ProgressFn,
+    ) -> Result<()> {
+        let mut s = self
+            .session
+            .take()
+            .ok_or_else(|| anyhow!("устройство не поднято"))?;
+        let (_, off, physical) = amlogic::partition(partition)
+            .ok_or_else(|| anyhow!("в карте разделов нет {partition}"))?;
+        let image_len = std::fs::metadata(image)?.len() as usize;
+        // the deterministic checks of write_data_pass, hoisted: a
+        // retry loop must not spin on them
+        anyhow::ensure!(
+            image_len > 0 && image_len.is_multiple_of(amlogic::nand::PAGE_SIZE as usize),
+            "{partition}: размер образа некратен странице"
+        );
+        anyhow::ensure!(
+            physical as usize >= image_len,
+            "{partition}: образ больше физического раздела"
+        );
+        let mut file = std::fs::File::open(image)?;
+        log::info!(
+            "запись {partition}: {} ({})",
+            humansize(image_len as u64),
+            image.display()
+        );
+        progress(jb_core::progress::Progress::TransferStart {
+            name: partition.into(),
+            bytes: image_len as u64,
+        });
+        let mut st = WriteState::fresh();
+        let mut last = 0usize;
+        let mut stalls = 0u32;
+        loop {
+            let done = write_data_pass(
+                &mut s,
+                &mut file,
+                off,
+                physical,
+                image_len,
+                &mut st,
+                &|done| {
+                    progress(jb_core::progress::Progress::TransferProgress {
+                        name: partition.into(),
+                        done: done as u64,
+                        total: image_len as u64,
+                    });
+                },
+            )
+            .with_context(|| format!("проход записи {partition}"))?;
+            if done {
+                break;
+            }
+            stalls = if st.written > last { 0 } else { stalls + 1 };
+            last = last.max(st.written);
+            if stalls >= MAX_STALLED_WINDOWS {
+                self.session = Some(s);
+                bail!(
+                    "окна идут, а запись {partition} стоит на месте ({}/{}): \
+                     проверьте кабель/плату",
+                    humansize(st.written as u64),
+                    humansize(image_len as u64)
+                );
+            }
+            log::info!(
+                "записано {} из {} ({partition}) — нужно свежее окно",
+                humansize(st.written as u64),
+                humansize(image_len as u64)
+            );
+            s = reconnect_window(s, progress)
+                .context("перезаход в окно после исчерпания записи")?;
+        }
+        progress(jb_core::progress::Progress::TransferDone {
+            name: partition.into(),
+        });
+        self.session = Some(s);
+        Ok(())
+    }
+}
+
+/// The capture's data partition as the patch base: published as the
+/// numbered image (07_data.img) only when fully read. A Warnings
+/// capture with a full data image still serves (short sections are
+/// bad blocks elsewhere); a missing one yields None — the
+/// jailbreak-only gate in `data_size` then rejects the run.
 fn capture_base(report: &BackupReport) -> Option<PathBuf> {
-    let data = report.path.join("data.bin");
+    let data = report.path.join(capture::image_file("data"));
     match report.status {
         Status::Complete => Some(data),
         Status::Warnings if data.is_file() => Some(data),
         _ => None,
     }
+}
+
+/// The amlogic backup root: backup/capsule-mini/ (per-model layout —
+/// identity keys of different platforms may collide).
+fn backup_root() -> PathBuf {
+    Path::new("backup").join(Model::CapsuleMini.dir_name())
 }
 
 /// Raise a session: catch the 1b8e:c003 window (open the device
@@ -541,10 +665,10 @@ pub fn bring_up(
                 );
             }
         }
-        if let Some(d) = deadline {
-            if start.elapsed() >= d {
-                bail!("колонка Amlogic не появилась на шине (--wait)");
-            }
+        if let Some(d) = deadline
+            && start.elapsed() >= d
+        {
+            bail!("колонка Amlogic не появилась на шине (--wait)");
         }
         std::thread::sleep(POLL_INTERVAL);
     }

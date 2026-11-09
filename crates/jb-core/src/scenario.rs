@@ -1,8 +1,10 @@
 //! The platform-agnostic jailbreak scenario. One skeleton drives the
-//! flow — prepare (session + backup) → measure the data partition →
-//! confirm → build the image → write → finish — and a platform fills in
-//! the device-specific steps through the [`Platform`] trait. The CLI
-//! backends implement the trait; the same skeleton also runs the
+//! flow — ensure the backup (session + capture) → measure the data
+//! partition → confirm → build the image → write → finish — and a
+//! platform fills in the device-specific steps through the [`Platform`]
+//! trait. The session bring-up itself is the backend's
+//! [`crate::backend::Backend::connect`]: the scenario starts with the
+//! device already connected. The same skeleton also runs the
 //! backup-only flow.
 //!
 //! Nothing is verified after the write on any platform (the write is
@@ -11,24 +13,52 @@
 
 use crate::overlay::{self, OverlayFile};
 use crate::progress::ProgressFn;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::PathBuf;
-use std::time::Duration;
 
-/// Run modifiers, straight from the CLI flags.
-#[derive(Debug, Clone, Copy, Default)]
+/// Run modifiers, straight from the CLI flags / the TUI settings.
+#[derive(Debug, Clone, Copy)]
 pub struct Params {
     /// Build the image from scratch even when a verified base exists
     /// (--format-userdata): the partition content does not survive.
     pub format_userdata: bool,
     /// Skip both the check and the capture of the backup (--no-backup).
     pub no_backup: bool,
-    /// Deadline for the device to appear on the bus; None = wait forever.
-    pub wait: Option<Duration>,
+    /// Put adbd into the overlay (the default; --no-adbd turns it off —
+    /// only the gadget flag and the jailbreak marker are written then).
+    pub adbd: bool,
 }
 
-/// What [`Platform::prepare`] delivers: the device is up and the
-/// backup decision is made.
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            format_userdata: false,
+            no_backup: false,
+            adbd: true,
+        }
+    }
+}
+
+/// The backup situation of the CONNECTED column, as the local catalog
+/// sees it (no device I/O). This is what a UI shows next to the
+/// column; the real checksum verification still happens in
+/// [`Platform::ensure_backup`] before a capture becomes the base of
+/// the only copy.
+#[derive(Debug, Clone)]
+pub enum BackupState {
+    /// No capture directory for this column at all.
+    None,
+    /// A capture that opened and passed the checksum verification —
+    /// usable as the patch base and for restore.
+    Verified { dir: PathBuf },
+    /// A capture exists but cannot serve as a base: taken with caveats
+    /// (the first-generation 0xCC mask, amlogic bad blocks) or failed
+    /// verification. `why` carries the reasons for the UI.
+    Unusable { dir: PathBuf, why: Vec<String> },
+}
+
+/// What [`Platform::ensure_backup`] delivers: the backup decision is
+/// made (a new capture taken or an existing one reused).
 pub struct Prepared {
     /// Verified capture of the data partition usable as the patch base.
     /// None = build from scratch (no capture, a capture that cannot
@@ -49,6 +79,7 @@ pub struct Prepared {
 /// The write about to happen, as the confirmation prompt sees it. The
 /// platform wording (filesystem, what survives) is baked into `mode`
 /// by [`Platform::describe_write`].
+#[derive(Clone, Debug)]
 pub struct WritePlan {
     /// The partition name as the platform calls it (userdata on
     /// rockchip, data on amlogic).
@@ -76,19 +107,18 @@ pub type Confirm<'a> = &'a dyn Fn(&WritePlan) -> Result<()>;
 /// The device-specific steps of the scenario, implemented by the CLI
 /// backends over their transports. Every hook may talk to the device
 /// (and, on amlogic, go through reconnect windows) — the skeleton only
-/// fixes the order.
+/// fixes the order. The device is already connected
+/// ([`crate::backend::Backend::connect`]) when the hooks run.
 pub trait Platform {
-    /// Bring the device into a working state and settle the backup:
-    /// capture it (a checkpoint loop where the platform needs one) or
-    /// find the verified capture of this column. `no_backup` skips both
-    /// the check and the capture; the session the hooks run over is
-    /// kept in the platform state.
-    fn prepare(
-        &mut self,
-        no_backup: bool,
-        wait: Option<Duration>,
-        progress: ProgressFn,
-    ) -> Result<Prepared>;
+    /// Settle the backup: capture it (a checkpoint loop where the
+    /// platform needs one) or find the verified capture of this column.
+    /// `no_backup` skips both the check and the capture; the session
+    /// the hooks run over is kept in the platform state.
+    fn ensure_backup(&mut self, no_backup: bool, progress: ProgressFn) -> Result<Prepared>;
+
+    /// The connected column's [`BackupState`] from the local catalog
+    /// (pure filesystem, no device I/O).
+    fn backup_state(&self) -> BackupState;
 
     /// Logical size of the data partition, bytes (the size the image
     /// must be built to).
@@ -122,12 +152,34 @@ pub trait Platform {
     /// read back afterwards.
     fn write_data_image(&mut self, image: &std::path::Path, progress: ProgressFn) -> Result<()>;
 
+    /// The full-restore set of the connected column: every INTACT
+    /// partition image of the verified capture, with the partitions
+    /// whose capture is garbage/short (the first-generation 0xCC mask,
+    /// amlogic bad blocks) reported in `skipped` — those must never be
+    /// flashed back. An Err means there is no verified capture at all.
+    fn restore_set(&mut self) -> Result<(Vec<RestoreItem>, Vec<String>)>;
+
+    /// Write the restore set back to the device — everything that can
+    /// be restored (plus the restorable platform metadata: the GPT and
+    /// the idblock on rockchip; the device-unique AML-reserved areas
+    /// and the environment on amlogic are NEVER written). Called after
+    /// the confirmation; nothing is verified afterwards.
+    fn write_restore(&mut self, items: &[RestoreItem], progress: ProgressFn) -> Result<()>;
+
     /// Reboot the device and print the platform's final instructions.
     fn finish(&mut self, progress: ProgressFn) -> Result<()>;
 
     /// The backup-only flow's result line (platform wording: what was
     /// captured, where, and the caveats).
     fn report_backup(&self, prepared: &Prepared);
+}
+
+/// One image of a full restore.
+#[derive(Debug, Clone)]
+pub struct RestoreItem {
+    pub partition: String,
+    pub image: PathBuf,
+    pub size: u64,
 }
 
 /// The jailbreak flow over any platform. The overlay file set (adbd +
@@ -139,7 +191,7 @@ pub fn jailbreak(
     confirm: Confirm,
     progress: ProgressFn,
 ) -> Result<()> {
-    let prepared = platform.prepare(params.no_backup, params.wait, progress)?;
+    let prepared = platform.ensure_backup(params.no_backup, progress)?;
     let size = platform.data_size(progress)?;
     let fresh = params.format_userdata || params.no_backup || prepared.base.is_none();
     let plan = WritePlan {
@@ -153,8 +205,12 @@ pub fn jailbreak(
     // Nothing has been written at this point, so a refusal is safe.
     confirm(&plan)?;
 
-    let base = if fresh { None } else { prepared.base.as_deref() };
-    let files = overlay::overlay_files(overlay_marker());
+    let base = if fresh {
+        None
+    } else {
+        prepared.base.as_deref()
+    };
+    let files = overlay::overlay_files(overlay_marker(), params.adbd);
     let out = std::path::Path::new("work").join("userdata.img");
     platform.build_data_image(base, &out, size, &files, progress)?;
     platform.write_data_image(&out, progress)?;
@@ -167,61 +223,51 @@ pub fn jailbreak(
 /// step. The overlay and everything written after the capture do not
 /// survive; the capture's own content (session files included) does.
 /// `--no-backup` is rejected by the CLI for this subcommand.
-pub fn restore(
-    platform: &mut dyn Platform,
-    wait: Option<Duration>,
-    confirm: Confirm,
-    progress: ProgressFn,
-) -> Result<()> {
-    let prepared = platform.prepare(false, wait, progress)?;
-    let Some(base) = prepared.base.as_deref() else {
+pub fn restore(platform: &mut dyn Platform, confirm: Confirm, progress: ProgressFn) -> Result<()> {
+    let _prepared = platform.ensure_backup(false, progress)?;
+    let (items, skipped) = platform.restore_set()?;
+    if items.is_empty() {
         bail!(
-            "восстановление невозможно: нет верифицированного захвата {} \
-             для этой колонки{}; сначала снимите его — capsula-jb backup",
-            platform.data_partition(),
-            if prepared.complete {
+            "восстановление невозможно: в захвате этой колонки нет ни \
+             одного целого образа{}",
+            if skipped.is_empty() {
                 String::new()
             } else {
-                String::from(" (захват этой колонки нецелостный — восстановить его нельзя)")
+                format!(" (все нецелые: {})", skipped.join(", "))
             }
         );
-    };
-    // Sanity: the capture must fit the partition as it is now.
-    let size = platform.data_size(progress)?;
-    let base_len = std::fs::metadata(base)?.len();
-    if base_len > size {
-        bail!(
-            "захват {} ({} байт) больше текущего раздела ({} байт) — \
-             бед-блоки прибавились, восстановление такого образа не влезет",
-            base.display(),
-            base_len,
-            size
-        );
+    }
+    // The per-image size sanity (the capture must fit the partition as
+    // it is now — bad blocks may have grown it) is the platform's, in
+    // write_restore: only it knows the live tables.
+    let total: u64 = items.iter().map(|i| i.size).sum();
+    let mut mode = platform.describe_restore();
+    if !skipped.is_empty() {
+        mode.push_str(&format!(
+            "; пропущены (захват нецелый): {}",
+            skipped.join(", ")
+        ));
     }
     let plan = WritePlan {
-        partition: platform.data_partition(),
-        size: base_len,
+        partition: "все разделы",
+        size: total,
         fresh: false,
         no_backup: false,
         restore: true,
-        mode: platform.describe_restore(),
+        mode,
     };
     // Nothing has been written at this point, so a refusal is safe.
     confirm(&plan)?;
-    platform.write_data_image(base, progress)?;
+    platform.write_restore(&items, progress)?;
     platform.finish(progress)?;
     Ok(())
 }
 
-/// The backup-only flow: prepare (session + capture, never writes to
+/// The backup-only flow: ensure the backup (capture, never writes to
 /// the column) and report. `--no-backup` is rejected by the CLI for
 /// this subcommand, so `no_backup` is always false here.
-pub fn backup(
-    platform: &mut dyn Platform,
-    wait: Option<Duration>,
-    progress: ProgressFn,
-) -> Result<()> {
-    let prepared = platform.prepare(false, wait, progress)?;
+pub fn backup(platform: &mut dyn Platform, progress: ProgressFn) -> Result<()> {
+    let prepared = platform.ensure_backup(false, progress)?;
     platform.report_backup(&prepared);
     Ok(())
 }
@@ -229,29 +275,7 @@ pub fn backup(
 /// The jailbreak marker written into the overlay: the tool and the run
 /// time, so a booted column can tell who unlocked it.
 fn overlay_marker() -> String {
-    format!("capsula-jb userspace {}\n", utc_now_iso())
-}
-
-/// The current UTC time as 2026-11-01T12:34:56Z (no external crates).
-fn utc_now_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (h, m, s) = (rem / 3600, (rem / 60) % 60, rem % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mth <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    format!("capsula-jb userspace {}\n", crate::format::utc_now_iso())
 }
 
 #[cfg(test)]
@@ -271,6 +295,13 @@ mod tests {
         got_base: RefCell<Option<PathBuf>>,
         /// The image the write hook actually received.
         written_image: RefCell<Option<PathBuf>>,
+        /// What restore_set returns: (items, skipped). An Err in
+        /// `restore_err` short-circuits instead.
+        restore_items: Vec<RestoreItem>,
+        restore_skipped: Vec<String>,
+        restore_err: bool,
+        /// The items write_restore actually received.
+        restored: RefCell<Vec<String>>,
     }
 
     impl MockPlatform {
@@ -281,6 +312,14 @@ mod tests {
                 calls: RefCell::new(vec![]),
                 got_base: RefCell::new(None),
                 written_image: RefCell::new(None),
+                restore_items: vec![RestoreItem {
+                    partition: "testpart".into(),
+                    image: PathBuf::from("/tmp/never/testpart.img"),
+                    size: 4096,
+                }],
+                restore_skipped: vec![],
+                restore_err: false,
+                restored: RefCell::new(vec![]),
             }
         }
 
@@ -290,20 +329,22 @@ mod tests {
     }
 
     impl Platform for MockPlatform {
-        fn prepare(
-            &mut self,
-            no_backup: bool,
-            _wait: Option<Duration>,
-            _progress: ProgressFn,
-        ) -> Result<Prepared> {
+        fn ensure_backup(&mut self, no_backup: bool, _progress: ProgressFn) -> Result<Prepared> {
             self.mark("prepare");
             let base = if no_backup { None } else { self.base.clone() };
             Ok(Prepared {
                 base,
                 dumped: true,
-                dir: self.base.as_ref().map(|b| b.parent().unwrap().to_path_buf()),
+                dir: self
+                    .base
+                    .as_ref()
+                    .map(|b| b.parent().unwrap().to_path_buf()),
                 complete: true,
             })
+        }
+
+        fn backup_state(&self) -> BackupState {
+            BackupState::None
         }
 
         fn data_size(&mut self, _progress: ProgressFn) -> Result<u64> {
@@ -343,6 +384,20 @@ mod tests {
             Ok(())
         }
 
+        fn restore_set(&mut self) -> Result<(Vec<RestoreItem>, Vec<String>)> {
+            self.mark("set");
+            if self.restore_err {
+                bail!("восстановление невозможно: нет верифицированного захвата");
+            }
+            Ok((self.restore_items.clone(), self.restore_skipped.clone()))
+        }
+
+        fn write_restore(&mut self, items: &[RestoreItem], _progress: ProgressFn) -> Result<()> {
+            self.mark("restore_write");
+            *self.restored.borrow_mut() = items.iter().map(|i| i.partition.clone()).collect();
+            Ok(())
+        }
+
         fn finish(&mut self, _progress: ProgressFn) -> Result<()> {
             self.mark("finish");
             Ok(())
@@ -363,7 +418,10 @@ mod tests {
             &mut p,
             &Params::default(),
             &|plan| {
-                assert_eq!((plan.size, plan.fresh, plan.no_backup), (4096, false, false));
+                assert_eq!(
+                    (plan.size, plan.fresh, plan.no_backup),
+                    (4096, false, false)
+                );
                 assert_eq!(plan.mode, "patch");
                 Ok(())
             },
@@ -383,13 +441,19 @@ mod tests {
         let mut p = MockPlatform::new(None);
         jailbreak(&mut p, &Params::default(), &|_| Ok(()), &noop).unwrap();
         assert!(p.got_base.borrow().is_none());
-        assert_eq!(*p.calls.borrow(), vec!["prepare", "data_size", "build", "write", "finish"]);
+        assert_eq!(
+            *p.calls.borrow(),
+            vec!["prepare", "data_size", "build", "write", "finish"]
+        );
 
         // a base exists but --no-backup drops it
         let mut p = MockPlatform::new(Some(PathBuf::from("/tmp/never/u.img")));
         jailbreak(
             &mut p,
-            &Params { no_backup: true, ..Default::default() },
+            &Params {
+                no_backup: true,
+                ..Default::default()
+            },
             &|plan| {
                 assert!(plan.fresh && plan.no_backup);
                 Ok(())
@@ -403,61 +467,97 @@ mod tests {
     #[test]
     fn jailbreak_stops_when_the_confirmation_refuses() {
         let mut p = MockPlatform::new(None);
-        let err = jailbreak(&mut p, &Params::default(), &|_| anyhow::bail!("прервано"), &noop)
-            .unwrap_err();
+        let err = jailbreak(
+            &mut p,
+            &Params::default(),
+            &|_| anyhow::bail!("прервано"),
+            &noop,
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "прервано");
         // nothing was built or written
         assert_eq!(*p.calls.borrow(), vec!["prepare", "data_size"]);
     }
 
     #[test]
-    fn restore_writes_the_capture_back() {
-        let base = std::env::temp_dir().join(format!("jb-scenario-r1-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
-        let base = base.join("data.bin");
-        std::fs::write(&base, b"capture").unwrap();
-        let mut p = MockPlatform::new(Some(base.clone()));
+    fn restore_writes_the_whole_intact_set() {
+        let mut p = MockPlatform::new(None);
+        p.restore_items = vec![
+            RestoreItem {
+                partition: "uboot".into(),
+                image: PathBuf::from("/tmp/never/00_uboot.img"),
+                size: 1024,
+            },
+            RestoreItem {
+                partition: "testpart".into(),
+                image: PathBuf::from("/tmp/never/01_testpart.img"),
+                size: 4096,
+            },
+        ];
+        p.restore_skipped = vec!["boot_b".into()];
         let confirmed = std::cell::RefCell::new(None);
-        restore(&mut p, None, &|plan| {
-            assert!(plan.restore);
-            assert_eq!(plan.size, 7);
-            *confirmed.borrow_mut() = Some(plan.mode.clone());
-            Ok(())
-        }, &noop)
+        restore(
+            &mut p,
+            &|plan| {
+                assert!(plan.restore);
+                assert_eq!(plan.partition, "все разделы");
+                assert_eq!(plan.size, 1024 + 4096);
+                assert_eq!(plan.mode, "restore; пропущены (захват нецелый): boot_b");
+                *confirmed.borrow_mut() = Some(plan.mode.clone());
+                Ok(())
+            },
+            &noop,
+        )
         .unwrap();
-        assert_eq!(confirmed.borrow().as_deref(), Some("restore"));
+        assert_eq!(
+            confirmed.borrow().as_deref(),
+            Some("restore; пропущены (захват нецелый): boot_b")
+        );
         assert_eq!(
             *p.calls.borrow(),
-            vec!["prepare", "data_size", "write", "finish"]
+            vec!["prepare", "set", "restore_write", "finish"]
         );
-        assert_eq!(p.written_image.borrow().as_deref(), Some(base.as_path()));
+        assert_eq!(*p.restored.borrow(), vec!["uboot", "testpart"]);
     }
 
     #[test]
-    fn restore_without_a_base_refuses() {
+    fn restore_without_a_capture_refuses() {
         let mut p = MockPlatform::new(None);
-        let err = restore(&mut p, None, &|_| Ok(()), &noop).unwrap_err();
-        assert!(err.to_string().contains("восстановление невозможно"), "{err}");
+        p.restore_err = true;
+        let err = restore(&mut p, &|_| Ok(()), &noop).unwrap_err();
+        assert!(
+            err.to_string().contains("восстановление невозможно"),
+            "{err}"
+        );
         // nothing was written
-        assert_eq!(*p.calls.borrow(), vec!["prepare"]);
+        assert_eq!(*p.calls.borrow(), vec!["prepare", "set"]);
+    }
+
+    #[test]
+    fn restore_with_no_intact_images_refuses() {
+        let mut p = MockPlatform::new(None);
+        p.restore_items = vec![];
+        p.restore_skipped = vec!["userdata".into(), "boot_b".into()];
+        let err = restore(&mut p, &|_| Ok(()), &noop).unwrap_err();
+        assert!(
+            err.to_string().contains("нет ни одного целого образа"),
+            "{err}"
+        );
+        assert_eq!(*p.calls.borrow(), vec!["prepare", "set"]);
     }
 
     #[test]
     fn restore_stops_when_the_confirmation_refuses() {
-        let base = std::env::temp_dir().join(format!("jb-scenario-r2-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
-        let base = base.join("data.bin");
-        std::fs::write(&base, b"capture").unwrap();
-        let mut p = MockPlatform::new(Some(base));
-        let err = restore(&mut p, None, &|_| anyhow::bail!("прервано"), &noop).unwrap_err();
+        let mut p = MockPlatform::new(None);
+        let err = restore(&mut p, &|_| anyhow::bail!("прервано"), &noop).unwrap_err();
         assert_eq!(err.to_string(), "прервано");
-        assert_eq!(*p.calls.borrow(), vec!["prepare", "data_size"]);
+        assert_eq!(*p.calls.borrow(), vec!["prepare", "set"]);
     }
 
     #[test]
     fn backup_reports_and_never_writes() {
         let mut p = MockPlatform::new(Some(PathBuf::from("/tmp/never/cap/userdata.img")));
-        backup(&mut p, None, &noop).unwrap();
+        backup(&mut p, &noop).unwrap();
         assert_eq!(*p.calls.borrow(), vec!["prepare", "report"]);
     }
 }
