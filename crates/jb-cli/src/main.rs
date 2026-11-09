@@ -77,6 +77,19 @@ fn main() -> anyhow::Result<()> {
     if let Some(cwd) = win_drv::fix_cwd_if_system32() {
         log::info!("рабочий каталог: {}", cwd.display());
     }
+    // No arguments at all — the GUI (macOS/Windows). Any argument,
+    // even a bare global flag, keeps the CLI path below; Linux has no
+    // GUI build (gpui needs system X11/Wayland libraries) and keeps
+    // the CLI no-args scenario. Closing the window ends the process;
+    // the Windows console pause does not apply to the GUI.
+    #[cfg(not(target_os = "linux"))]
+    if std::env::args_os().skip(1).next().is_none() {
+        if let Err(e) = jb_gui::run() {
+            log::error!("{e:?}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let cli = Cli::parse();
     let wait = if cli.wait == 0 {
         None

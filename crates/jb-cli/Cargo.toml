@@ -25,6 +25,12 @@ indicatif = { workspace = true }
 # non-Windows, so it is an unconditional dependency
 win-drv = { workspace = true }
 
+# The GUI (gpui) needs system X11/Wayland libraries on Linux and stays
+# out of the aarch64 CI cross-build; there the no-args run keeps the
+# CLI scenario.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+jb-gui = { workspace = true }
+
 [build-dependencies]
 # embeds capsula-jb.manifest (requireAdministrator) into the exe
 embed-resource = "3"

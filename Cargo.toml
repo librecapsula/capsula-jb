@@ -7,6 +7,7 @@ members = [
     "crates/jb-rockchip",
     "crates/jb-amlogic",
     "crates/jb-cli",
+    "crates/jb-gui",
     "crates/win-drv",
 ]
 
@@ -23,6 +24,7 @@ amlogic = { path = "crates/amlogic" }
 jb-core = { path = "crates/jb-core" }
 jb-rockchip = { path = "crates/jb-rockchip" }
 jb-amlogic = { path = "crates/jb-amlogic" }
+jb-gui = { path = "crates/jb-gui" }
 win-drv = { path = "crates/win-drv" }
 
 # usb / protocol
@@ -53,6 +55,13 @@ ubifs = "0.1"
 # cli / progress / gui
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
+# GPU-accelerated UI framework (Zed); system X11/Wayland libs on
+# Linux, so the GUI build stays macOS/Windows-only (target-gated in
+# jb-cli). The resolver lands on 0.2.1: 0.2.2 conflicts with nusb's
+# core-foundation requirement. `runtime_shaders` compiles the Metal
+# shaders at startup instead of build-time `xcrun metal`, so the
+# build works on Command Line Tools alone (no full Xcode needed).
+gpui = { version = "0.2", features = ["runtime_shaders"] }
 
 [profile.release]
 lto = "thin"
