@@ -243,13 +243,16 @@ impl App {
                 }
             }
             Focus::ModalOk => match self.confirm.take() {
-                // Proceed on both: the write goes ahead; the degraded
-                // connect re-waits for the device (the stock loader
-                // persona only) and connects again
-                Some(Confirm::Write { reply, .. }) | Some(Confirm::Firstgen { reply, .. }) => {
-                    if let Some(reply) = reply {
-                        let _ = reply.send(jb_core::session::Decision::Proceed);
-                    }
+                // Proceed on the worker-backed confirms: the write goes
+                // ahead; the degraded connect re-waits for the device
+                // (the stock loader persona only); a failed connect
+                // re-waits for the column and retries
+                Some(
+                    c @ (Confirm::Write { .. }
+                    | Confirm::Firstgen { .. }
+                    | Confirm::Reconnect { .. }),
+                ) => {
+                    c.reply(jb_core::session::Decision::Proceed);
                     if self.screen == Screen::Main {
                         self.focus = Focus::Flash;
                     }
@@ -280,16 +283,11 @@ impl App {
         self.hints = vec![crate::hint_text(self.selected_model).to_string()];
     }
 
-    /// Answer the write/first-gen confirm with Abort (or just drop a
-    /// local modal).
+    /// Answer the confirm with Abort (a local modal is just dropped —
+    /// `Confirm::reply` is a no-op without a worker channel).
     fn cancel_confirm(&mut self) {
-        match self.confirm.take() {
-            Some(Confirm::Write { reply, .. }) | Some(Confirm::Firstgen { reply, .. }) => {
-                if let Some(reply) = reply {
-                    let _ = reply.send(jb_core::session::Decision::Abort);
-                }
-            }
-            Some(Confirm::DeleteBackup { .. }) | None => {}
+        if let Some(c) = self.confirm.take() {
+            c.reply(jb_core::session::Decision::Abort);
         }
         if self.screen == Screen::Main {
             self.focus = Focus::Flash;

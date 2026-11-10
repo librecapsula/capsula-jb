@@ -119,8 +119,33 @@ pub enum Confirm {
         notice: Vec<String>,
         reply: Option<Sender<jb_core::session::Decision>>,
     },
+    /// The connect failed outright (a wedged loader persona, a refused
+    /// reset): the user is asked to re-enter the column (the worker is
+    /// BLOCKED until the reply). Continue = wait for the device again
+    /// and retry connect; Esc aborts the run.
+    Reconnect {
+        why: String,
+        reply: Option<Sender<jb_core::session::Decision>>,
+    },
     /// Local: delete the backup directory.
     DeleteBackup { dir: PathBuf },
+}
+
+impl Confirm {
+    /// Send the decision to the blocked worker. Local confirms (a
+    /// delete) carry no reply channel and are simply dropped.
+    fn reply(&self, decision: jb_core::session::Decision) {
+        match self {
+            Confirm::Write { reply, .. }
+            | Confirm::Firstgen { reply, .. }
+            | Confirm::Reconnect { reply, .. } => {
+                if let Some(tx) = reply {
+                    let _ = tx.send(decision);
+                }
+            }
+            Confirm::DeleteBackup { .. } => {}
+        }
+    }
 }
 
 pub struct App {
@@ -267,6 +292,18 @@ impl App {
                 self.screen = Screen::Waiting;
                 self.confirm = Some(Confirm::Firstgen {
                     notice,
+                    reply: Some(reply),
+                });
+                self.focus = Focus::ModalOk;
+            }
+            Event::ConnectFailed { why, reply } => {
+                // The connect died on a device-state problem; the same
+                // settlement as the first-gen modal: behind it the
+                // waiting screen shows the hints — after "continue"
+                // the worker waits for the column again.
+                self.screen = Screen::Waiting;
+                self.confirm = Some(Confirm::Reconnect {
+                    why,
                     reply: Some(reply),
                 });
                 self.focus = Focus::ModalOk;

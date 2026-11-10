@@ -86,6 +86,15 @@ pub enum Event {
         notice: Vec<String>,
         reply: Sender<Decision>,
     },
+    /// The connect failed outright (a Fatal from the platform: a wedged
+    /// loader persona, a refused reset — usually fixed by re-entering
+    /// the download mode). The worker is BLOCKED until `reply` answers;
+    /// on `Proceed` it waits for the device again and retries connect.
+    /// Dropping the sender aborts the run with the error reported.
+    ConnectFailed {
+        why: String,
+        reply: Sender<Decision>,
+    },
     /// The operation ended (Ok = the scenario completed). The worker
     /// stays alive for the next command.
     Finished(Result<()>),
@@ -143,20 +152,10 @@ fn worker(
         let _ = events.send(Event::Progress(ev));
     };
     let confirm = |plan: &WritePlan| -> Result<()> {
-        let (reply, answer) = channel::<Decision>();
-        if events
-            .send(Event::ConfirmRequested {
-                plan: plan.clone(),
-                reply,
-            })
-            .is_err()
-        {
-            bail!("прервано пользователем");
-        }
-        match answer.recv() {
-            Ok(Decision::Proceed) => Ok(()),
-            Ok(Decision::Abort) | Err(_) => bail!("прервано пользователем"),
-        }
+        ask_user(&events, |reply| Event::ConfirmRequested {
+            plan: plan.clone(),
+            reply,
+        })
     };
 
     for cmd in commands {
@@ -172,17 +171,39 @@ fn worker(
     }
 }
 
+/// One blocking user round trip: emit the event carrying a fresh reply
+/// channel and wait for the decision. Ok = Proceed; an abort (or the
+/// UI dropping its end) is Err("прервано пользователем").
+fn ask_user(
+    events: &Sender<Event>,
+    mk_event: impl FnOnce(Sender<Decision>) -> Event,
+) -> Result<()> {
+    let (reply, answer) = channel::<Decision>();
+    if events.send(mk_event(reply)).is_err() {
+        bail!("прервано пользователем");
+    }
+    match answer.recv() {
+        Ok(Decision::Proceed) => Ok(()),
+        Ok(Decision::Abort) | Err(_) => bail!("прервано пользователем"),
+    }
+}
+
 /// Poll every backend's presence, connect the first one that shows up.
-/// Emits [`Event::WaitingForDevice`] once while the bus is empty. A
-/// connect that returns [`ConnectError::Attention`] asks the user; on
-/// `Proceed` the loop continues waiting (the backend itself narrows
-/// `present()` to what it accepts) and connect runs again.
+/// Emits [`Event::WaitingForDevice`] once while the bus is empty. Both
+/// connect errors are user round trips: [`ConnectError::Attention`] (a
+/// degraded flow the user must consent to) and
+/// [`ConnectError::Fatal`] (a device-state problem — nothing was
+/// touched, the connect is identity-only, so a retry is always safe).
+/// On `Proceed` the backend returns to the wait (itself narrowing what
+/// it accepts where applicable), the hints re-announce and the `--wait`
+/// deadline renews (the time the user spent on the modal must not eat
+/// it); an abort ends the run.
 fn wait_for_backend(
     mut backends: Vec<Box<dyn Backend>>,
     wait: Option<Duration>,
     events: &Sender<Event>,
 ) -> Result<Box<dyn Backend>> {
-    let start = Instant::now();
+    let mut start = Instant::now();
     let mut hint_shown = false;
     loop {
         let mut chosen: Option<usize> = None;
@@ -208,20 +229,17 @@ fn wait_for_backend(
                     return Ok(b);
                 }
                 Err(ConnectError::Attention { notice }) => {
-                    let (reply, answer) = channel::<Decision>();
-                    if events
-                        .send(Event::AttentionRequested { notice, reply })
-                        .is_err()
-                    {
-                        bail!("прервано пользователем");
-                    }
-                    match answer.recv() {
-                        Ok(Decision::Proceed) => backends.push(b),
-                        Ok(Decision::Abort) | Err(_) => bail!("прервано пользователем"),
-                    }
+                    ask_user(events, |reply| Event::AttentionRequested { notice, reply })
                 }
-                Err(ConnectError::Fatal(e)) => return Err(e),
-            }
+                Err(ConnectError::Fatal(e)) => {
+                    let why = format!("{e:#}");
+                    log::error!("подключение не удалось: {why}");
+                    ask_user(events, |reply| Event::ConnectFailed { why, reply })
+                }
+            }?;
+            backends.push(b);
+            hint_shown = false;
+            start = Instant::now();
         } else if !hint_shown {
             let hints = backends
                 .iter()
@@ -248,12 +266,15 @@ mod tests {
 
     /// A scriptable backend: presence is a counter (0 = absent), the
     /// platform records hook calls and echoes a canned identity. The
-    /// first `attentions` connects return an Attention (a degraded-flow
-    /// consent) before the identity succeeds.
+    /// first `fatals` connects fail with a Fatal (a device-state
+    /// problem), then the first `attentions` connects return an
+    /// Attention (a degraded-flow consent) before the identity
+    /// succeeds.
     struct FakeBackend {
         present_after: u32,
         polls: RefCell<u32>,
         calls: RefCell<Vec<&'static str>>,
+        fatals: u32,
         attentions: u32,
         connect_attempts: Cell<u32>,
         identity: Identity,
@@ -266,6 +287,7 @@ mod tests {
                 present_after: 1,
                 polls: RefCell::new(0),
                 calls: RefCell::new(vec![]),
+                fatals: 0,
                 attentions: 0,
                 connect_attempts: Cell::new(0),
                 identity: Identity {
@@ -281,6 +303,12 @@ mod tests {
         fn with_attentions(attentions: u32) -> Self {
             let mut b = Self::online();
             b.attentions = attentions;
+            b
+        }
+
+        fn with_fatal_connects(fatals: u32) -> Self {
+            let mut b = Self::online();
+            b.fatals = fatals;
             b
         }
     }
@@ -381,7 +409,12 @@ mod tests {
             self.calls.borrow_mut().push("connect");
             let attempt = self.connect_attempts.get();
             self.connect_attempts.set(attempt + 1);
-            if attempt < self.attentions {
+            if attempt < self.fatals {
+                return Err(ConnectError::Fatal(anyhow::anyhow!(
+                    "wrong device mode: лоадер (330d) не отвечает"
+                )));
+            }
+            if attempt < self.fatals + self.attentions {
                 return Err(ConnectError::Attention {
                     notice: vec!["degraded".into()],
                 });
@@ -421,6 +454,7 @@ mod tests {
                 }
                 Event::Progress(_) => {}
                 Event::AttentionRequested { .. } => unreachable!("без attention"),
+                Event::ConnectFailed { .. } => unreachable!("без ошибки connect"),
             }
         }
         assert!(saw_identity && saw_backup_state && saw_connecting);
@@ -461,6 +495,83 @@ mod tests {
         loop {
             match session.events().recv().unwrap() {
                 Event::AttentionRequested { reply, .. } => {
+                    let _ = reply.send(Decision::Abort);
+                }
+                Event::Finished(r) => {
+                    assert_eq!(r.unwrap_err().to_string(), "прервано пользователем");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // the worker is gone: the channel closes
+        assert!(session.events().recv().is_err());
+    }
+
+    #[test]
+    fn connect_fatal_round_trip_retries_connect() {
+        // The first connect fails with a Fatal (a wedged persona); after
+        // Proceed the worker waits for the device again and connects.
+        let session = Session::spawn(vec![Box::new(FakeBackend::with_fatal_connects(1))], None);
+        session.command(Command::Backup);
+        let mut identity = false;
+        loop {
+            match session.events().recv().unwrap() {
+                Event::ConnectFailed { why, reply } => {
+                    assert!(why.contains("wrong device mode"), "текст ошибки: {why}");
+                    reply.send(Decision::Proceed).unwrap();
+                }
+                Event::DeviceConnected { identity: id } => {
+                    assert_eq!(id.key, "TESTSERIAL");
+                    identity = true;
+                }
+                Event::Finished(r) => {
+                    r.unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(identity, "после Proceed колонка должна подключиться");
+    }
+
+    #[test]
+    fn repeated_connect_fatals_keep_offering_the_retry() {
+        // Two Fatals in a row: each one is its own blocking round trip
+        // — answer every modal with Proceed; the worker survives the
+        // failed retries and finally connects (any platform's connect
+        // goes through this same generic worker path).
+        let session = Session::spawn(vec![Box::new(FakeBackend::with_fatal_connects(2))], None);
+        session.command(Command::Backup);
+        let mut refusals = 0;
+        let mut identity = false;
+        loop {
+            match session.events().recv().unwrap() {
+                Event::ConnectFailed { reply, .. } => {
+                    refusals += 1;
+                    reply.send(Decision::Proceed).unwrap();
+                }
+                Event::DeviceConnected { .. } => identity = true,
+                Event::Finished(r) => {
+                    r.unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(refusals, 2, "каждая ошибка — свой раунд-трип");
+        assert!(identity, "после двух Proceed колонка должна подключиться");
+    }
+
+    #[test]
+    fn connect_fatal_abort_ends_the_worker() {
+        let session = Session::spawn(
+            vec![Box::new(FakeBackend::with_fatal_connects(u32::MAX))],
+            None,
+        );
+        loop {
+            match session.events().recv().unwrap() {
+                Event::ConnectFailed { reply, .. } => {
                     let _ = reply.send(Decision::Abort);
                 }
                 Event::Finished(r) => {

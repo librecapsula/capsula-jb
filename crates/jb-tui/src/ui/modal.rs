@@ -1,6 +1,6 @@
 //! The modal overlay: a write confirmation (with the plan), a
-//! first-generation notice (a single Continue button) or a delete
-//! confirmation.
+//! first-generation notice (a single Continue button), a connect-error
+//! notice (Continue = re-wait for the column) or a delete confirmation.
 
 use super::{button, centered_rect};
 use crate::app::{App, Confirm, Focus};
@@ -56,6 +56,20 @@ fn modal(app: &App) -> Option<Modal> {
                     .map(|l| Line::from(l.clone()))
                     .collect::<Vec<_>>(),
             ),
+            "Продолжить",
+            true,
+        )),
+        Some(Confirm::Reconnect { why, .. }) => Some((
+            " Ошибка подключения ",
+            Text::from(vec![
+                Line::from("Не удалось подключиться:"),
+                Line::styled(why.clone(), Style::default().fg(Color::Red)),
+                String::new().into(),
+                Line::from(
+                    "Переподключите колонку (выключите и включите, при необходимости \
+                     войдите в режим загрузки) и нажмите «Продолжить».",
+                ),
+            ]),
             "Продолжить",
             true,
         )),

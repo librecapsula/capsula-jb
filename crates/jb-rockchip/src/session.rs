@@ -23,7 +23,7 @@ use jb_core::progress::{Progress, ProgressFn};
 use rockusb::loader::{LoaderSession, RESET_SUBCODE_MASKROM};
 use rockusb::monitor::wait_download_mode;
 use rockusb::{Error as UsbError, LoaderContainer, MaskRomSession, NusbTransport, Transport};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Bring-up error. `LoaderRejected`: the usbplug did not start — BootROM
 /// silently rejected the loader signature (an unsupported board).
@@ -32,6 +32,11 @@ use std::time::{Duration, Instant};
 /// a batch with an incompatible BootROM (the maskrom→loader hand-off
 /// fails on some 0100 units); the only way on is the stock loader, so
 /// the caller must ask the user and wait for a 330d re-entry.
+/// `UnknownIdentity`: the persona on the bus cannot identify the column
+/// (no loader serial) — a fatal connect error: without the serial
+/// neither the backup cache nor the first-generation path can be keyed;
+/// the only way forward is a re-entry through the loader persona (330d),
+/// the only one that reports the identity.
 #[derive(Debug, thiserror::Error)]
 pub enum BringUpError {
     #[error(transparent)]
@@ -40,6 +45,12 @@ pub enum BringUpError {
     LoaderRejected,
     #[error("первое поколение/несовместимый BootROM ({serial}): полный бэкап невозможен")]
     FirstGeneration { serial: String },
+    #[error(
+        "серийник колонки неизвестен: перезапустите её в режим лоадера \
+         (выключить питание, зажать Recovery, включить) — без серийника \
+         инструмент не может выбрать путь"
+    )]
+    UnknownIdentity,
 }
 
 /// The live device session after bring-up. `firstgen` can only be
@@ -135,29 +146,6 @@ fn is_identifying(serial: &str) -> bool {
     !serial.is_empty() && serial.chars().any(|c| c != '0')
 }
 
-/// An unknown-identity persona: a leftover usbplug from a previous
-/// run, a direct MaskROM entry, or a loader persona that did not yield
-/// a real serial. Without the serial neither the backup cache nor the
-/// first-generation path can be keyed, so no flow may proceed — the
-/// only way forward is re-entry through the loader persona (330d), the
-/// only one that reports the identity. Idempotent (prints once);
-/// records when the wait started for the `wait` deadline.
-fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: ProgressFn, hint: &str) {
-    if wait_loader.is_some() {
-        return;
-    }
-    *wait_loader = Some(Instant::now());
-    let mut msg = "серийник колонки неизвестен: перезапустите её в режим лоадера \
-                   (выключить питание, зажать Recovery, включить) — без серийника \
-                   инструмент не может выбрать путь"
-        .to_string();
-    if !hint.is_empty() {
-        msg.push('\n');
-        msg.push_str(hint);
-    }
-    progress(Progress::Step(msg));
-}
-
 /// What the caller needs from bring-up. The session persona follows
 /// the goal. The first generation never runs our usbplug (its locked
 /// BootROM rejects it) — with [`Goal::UsbPlug`] that is an error for
@@ -186,8 +174,9 @@ pub enum Goal {
 /// session; other personas never contribute (the BootROM gadget reports
 /// zeros). Every session MUST have an identifying serial: a persona
 /// that cannot identify the column (a leftover usbplug, a direct
-/// MaskROM entry, a broken serial read) is refused with a re-entry
-/// instruction, and only the loader persona is accepted afterwards.
+/// MaskROM entry, a broken serial read) fails with
+/// [`BringUpError::UnknownIdentity`] — a fatal connect error, the
+/// caller's reconnect round-trip asks the user for a loader re-entry.
 ///
 /// - Loader (330d) with a first-generation serial: [`Goal::StockLoader`]
 ///   keeps the stock loader — `firstgen = true`; [`Goal::UsbPlug`]
@@ -211,26 +200,10 @@ pub fn bring_up<B: Bus>(
 ) -> Result<BroughtUp<B::T>, BringUpError> {
     let hint = config.connect_text(Model::Capsula);
     let mut serial: Option<String> = None;
-    // Set (with the refusal timestamp) once an unknown-identity persona
-    // has been refused; afterwards only the loader persona (330d) may
-    // proceed, whatever else appears on the bus.
-    let mut wait_loader: Option<Instant> = None;
     loop {
-        if let (Some(limit), Some(at)) = (wait, wait_loader)
-            && at.elapsed() >= limit
-        {
-            return Err(UsbError::WrongMode(
-                "не дождался повторного входа в режим лоадера (--wait)".into(),
-            )
-            .into());
-        }
         let mode = bus.poll()?;
         let Some(mode) = mode else {
-            if wait_loader.is_some() {
-                std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
-            } else {
-                bus.wait_download_mode(wait, hint)?;
-            }
+            bus.wait_download_mode(wait, hint)?;
             continue;
         };
         match mode {
@@ -243,16 +216,14 @@ pub fn bring_up<B: Bus>(
                 if serial.is_none() {
                     serial = Some(normalize_serial(bus.loader_serial()));
                 }
-                if !is_identifying(serial.as_deref().unwrap_or("")) {
-                    // The loader persona did not yield a real serial
-                    // (broken read): drop it so the next loader
-                    // recognition reads again, and ask for a re-entry.
-                    serial = None;
-                    refuse_unknown_identity(&mut wait_loader, progress, hint);
-                    std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
-                    continue;
-                }
-                let serial = serial.clone().unwrap();
+                // A broken read or a gadget fallback (all zeros) keys to
+                // no column: a fatal error — the caller's reconnect
+                // round-trip asks for a loader re-entry (the next
+                // attempt reads the serial again).
+                let serial = match serial.as_deref() {
+                    Some(s) if is_identifying(s) => s.to_string(),
+                    _ => return Err(BringUpError::UnknownIdentity),
+                };
                 let firstgen = is_first_generation(&serial);
                 // Under Goal::UsbPlug the first generation is the
                 // caller's decision, not ours: its locked BootROM
@@ -294,11 +265,9 @@ pub fn bring_up<B: Bus>(
             rockusb::DeviceMode::MaskRom => {
                 // no serial read here: the identity is the loader serial
                 // captured above; a direct MaskROM entry has none — the
-                // persona cannot be keyed to a column, refuse it
+                // persona cannot be keyed to a column, a fatal error
                 let Some(ident) = serial.clone() else {
-                    refuse_unknown_identity(&mut wait_loader, progress, hint);
-                    std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
-                    continue;
+                    return Err(BringUpError::UnknownIdentity);
                 };
                 let session = download_usbplug(bus, config, loader, progress)
                     .map_err(|e| first_generation_or(e, ident.clone()))?;
@@ -312,20 +281,11 @@ pub fn bring_up<B: Bus>(
                 // A usbplug sighted here is a leftover from a previous
                 // run: the flow that downloaded it returned directly,
                 // so the serial is never known in this branch. Reusing
-                // it would mean an unidentified column — refuse and
-                // wait for the loader persona (the board has to be
-                // power-cycled into 330d anyway).
-                refuse_unknown_identity(&mut wait_loader, progress, hint);
-                std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
-                continue;
+                // it would mean an unidentified column — a fatal error
+                // (the board has to be power-cycled into 330d anyway).
+                return Err(BringUpError::UnknownIdentity);
             }
             other => {
-                if wait_loader.is_some() {
-                    // after a refusal only the loader persona counts;
-                    // keep waiting for it quietly
-                    std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
-                    continue;
-                }
                 log::info!("режим {}, жду download-режим", other.label());
                 bus.wait_download_mode(wait, hint)?;
             }

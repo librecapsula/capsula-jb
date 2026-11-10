@@ -11,11 +11,13 @@ use std::time::Duration;
 
 /// The same fake as jb-core's session tests, reused through a
 /// fresh Session per case (the worker serves one op at a time).
-/// `attentions`: how many first connects return the degraded-flow
-/// Attention before the identity succeeds (the rockchip first-gen
-/// settlement).
+/// `fatals`: how many first connects fail with a Fatal (a
+/// device-state problem, the reconnect modal); `attentions`: how many
+/// next connects return the degraded-flow Attention before the
+/// identity succeeds (the rockchip first-gen settlement).
 struct FakeBackend {
     identity: Identity,
+    fatals: std::cell::Cell<u32>,
     attentions: std::cell::Cell<u32>,
 }
 
@@ -94,6 +96,12 @@ impl Backend for FakeBackend {
         _w: Option<Duration>,
         _p: jb_core::progress::ProgressFn,
     ) -> Result<Identity, ConnectError> {
+        if self.fatals.get() > 0 {
+            self.fatals.set(self.fatals.get() - 1);
+            return Err(ConnectError::Fatal(anyhow::anyhow!(
+                "wrong device mode: лоадер (330d) не отвечает"
+            )));
+        }
         if self.attentions.get() > 0 {
             self.attentions.set(self.attentions.get() - 1);
             return Err(ConnectError::Attention {
@@ -119,6 +127,7 @@ fn fake_identity() -> Identity {
 fn fake_for_model(_: Model) -> Box<dyn Backend> {
     Box::new(FakeBackend {
         identity: fake_identity(),
+        fatals: std::cell::Cell::new(0),
         attentions: std::cell::Cell::new(0),
     })
 }
@@ -128,7 +137,18 @@ fn fake_for_model(_: Model) -> Box<dyn Backend> {
 fn firstgen_for_model(_: Model) -> Box<dyn Backend> {
     Box::new(FakeBackend {
         identity: fake_identity(),
+        fatals: std::cell::Cell::new(0),
         attentions: std::cell::Cell::new(1),
+    })
+}
+
+/// The fake whose first connect fails with a Fatal (a wedged loader
+/// persona — the reconnect modal path).
+fn failing_for_model(_: Model) -> Box<dyn Backend> {
+    Box::new(FakeBackend {
+        identity: fake_identity(),
+        fatals: std::cell::Cell::new(1),
+        attentions: std::cell::Cell::new(0),
     })
 }
 
@@ -201,6 +221,43 @@ fn firstgen_attention_esc_aborts() {
     a.activate(Focus::Model(0));
     pump(&mut a, |a| {
         matches!(a.confirm, Some(Confirm::Firstgen { .. }))
+    });
+    a.on_key(key(KeyCode::Esc));
+    assert!(a.confirm.is_none());
+    pump(&mut a, |a| a.error.is_some());
+    assert!(a.error.as_deref().unwrap().contains("прервано"));
+}
+
+/// A Fatal connect error (a wedged loader persona) becomes the
+/// reconnect modal over the waiting screen; Continue answers Proceed,
+/// the worker waits for the column and lands on Main.
+#[test]
+fn connect_fatal_modal_continues_to_main() {
+    let mut a = App::new(failing_for_model);
+    a.activate(Focus::Model(0));
+    pump(&mut a, |a| {
+        matches!(a.confirm, Some(Confirm::Reconnect { .. }))
+    });
+    // the modal sits over the waiting screen (the loader-mode hints)
+    assert_eq!(a.screen, Screen::Waiting);
+    assert_eq!(a.focus, Focus::ModalOk);
+    let Some(Confirm::Reconnect { why, .. }) = &a.confirm else {
+        unreachable!();
+    };
+    assert!(why.contains("wrong device mode"));
+    a.on_key(key(KeyCode::Enter)); // ModalOk -> Proceed
+    assert!(a.confirm.is_none());
+    pump(&mut a, |a| a.screen == Screen::Main);
+    assert_eq!(a.identity.as_ref().unwrap().key, "KEY");
+}
+
+/// Esc on the reconnect modal aborts the run like the first-gen one.
+#[test]
+fn connect_fatal_esc_aborts() {
+    let mut a = App::new(failing_for_model);
+    a.activate(Focus::Model(0));
+    pump(&mut a, |a| {
+        matches!(a.confirm, Some(Confirm::Reconnect { .. }))
     });
     a.on_key(key(KeyCode::Esc));
     assert!(a.confirm.is_none());

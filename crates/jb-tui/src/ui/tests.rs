@@ -130,3 +130,22 @@ fn firstgen_modal_is_continue_only() {
     assert!(a.hit.contains_key(&Focus::ModalOk));
     assert!(!a.hit.contains_key(&Focus::ModalCancel));
 }
+
+/// The connect-error modal is Continue-only as well (Esc aborts the
+/// run instead of a cancel button).
+#[test]
+fn reconnect_modal_is_continue_only() {
+    let mut a = app();
+    a.activate(Focus::Model(0));
+    a.screen = Screen::Waiting;
+    a.confirm = Some(Confirm::Reconnect {
+        why: "wrong device mode: лоадер (330d) не отвечает".into(),
+        reply: None,
+    });
+    a.focus = Focus::ModalOk;
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut a)).unwrap();
+    assert!(a.hit.contains_key(&Focus::ModalOk));
+    assert!(!a.hit.contains_key(&Focus::ModalCancel));
+}

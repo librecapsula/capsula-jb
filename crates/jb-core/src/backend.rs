@@ -16,14 +16,18 @@ use std::time::Duration;
 /// generation, or a batch whose BootROM refuses our loader) and a device
 /// re-entry. The worker shows the notice, waits for the device to appear
 /// again and retries connect; the backend itself narrows what it accepts
-/// after the attention.
+/// after the attention. A [`ConnectError::Fatal`] is reported to the user
+/// with an offer to re-enter the device and retry; a refusal ends the
+/// run (nothing has been touched — the connect is identity-only).
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     /// Show the notice, ask the user to continue; on `Proceed` wait for
     /// the device again and call connect once more.
     #[error("connect: требуется подтверждение пользователя")]
     Attention { notice: Vec<String> },
-    /// Anything else kills the run as before.
+    /// Report the error and offer a device re-entry; on `Proceed` wait
+    /// for the device again and call connect once more, on `Abort` end
+    /// the run.
     #[error(transparent)]
     Fatal(#[from] anyhow::Error),
 }

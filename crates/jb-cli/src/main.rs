@@ -234,6 +234,15 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(Event::ConnectFailed { reply, .. }) => match confirm_reconnect(cli.yes) {
+                Ok(()) => {
+                    let _ = reply.send(Decision::Proceed);
+                }
+                Err(e) => {
+                    abort_reason = Some(e);
+                    let _ = reply.send(Decision::Abort);
+                }
+            },
             Ok(Event::Finished(result)) => {
                 return match (result, abort_reason) {
                     (Err(e), Some(reason)) if e.to_string() == "прервано пользователем" => {
@@ -286,6 +295,23 @@ fn confirm_attention(notice: &[String], yes: bool) -> anyhow::Result<()> {
     log::info!("продолжить без полного бэкапа? [y/N]");
     ask_yes(
         "продолжения без полного бэкапа",
+        "на колонку не писалось, бэкап не снимался",
+    )
+}
+
+/// The connect failed outright (a device-state problem: a wedged
+/// loader persona, a refused reset; the error itself is already logged
+/// by the worker). On "continue" the worker waits for the device to
+/// reappear and connects again; a refusal ends the run with nothing
+/// touched.
+fn confirm_reconnect(yes: bool) -> anyhow::Result<()> {
+    if yes {
+        log::info!("--yes: жду переподключения колонки");
+        return Ok(());
+    }
+    log::info!("переподключить колонку и продолжить? [y/N]");
+    ask_yes(
+        "переподключения",
         "на колонку не писалось, бэкап не снимался",
     )
 }

@@ -496,8 +496,8 @@ fn degraded_notice(by_serial: bool) -> Vec<String> {
         } else {
             "Кажется, у вас колонка первого поколения — или партии, на которой наш лоадер не запускается.".into()
         },
-        "Полный бэкап на ней невозможен: выше 32 МиБ стоковый лоадер читает только мусор 0xCC.".into(),
-        "Продолжить можно без полного бэкапа: снимутся только разделы до boot_a, userdata будет собран с нуля.".into(),
+        "Полный бэкап на ней невозможен, но продолжить можно и без него.".into(),
+        "Колонка будет сброшена до заводских настроек.".into(),
     ];
     notice.push(if by_serial {
         "Колонка уже в режиме лоадера — просто нажмите «Продолжить».".into()
@@ -577,6 +577,9 @@ impl Rockchip {
             let up =
                 crate::session::bring_up(&mut bus, &self.config, &loader, wait, goal, progress)
                     .map_err(|e| match e {
+                        // bring_up never surfaces a raw LoaderRejected
+                        // under Goal::UsbPlug — it becomes this variant
+                        // naming the column (first_generation_or).
                         crate::session::BringUpError::FirstGeneration { serial } => {
                             // The user decides; on "continue" ONLY this column's
                             // stock loader (330d re-entry) is accepted.
@@ -589,12 +592,6 @@ impl Rockchip {
                             ConnectError::Attention {
                                 notice: degraded_notice(by_serial),
                             }
-                        }
-                        crate::session::BringUpError::LoaderRejected => {
-                            ConnectError::Fatal(anyhow!(
-                                "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
-                     плата — отпустите Recovery и войдите в режим лоадера заново)"
-                            ))
                         }
                         e => ConnectError::Fatal(anyhow!(e)),
                     })?;
