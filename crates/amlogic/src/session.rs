@@ -696,11 +696,7 @@ impl<T: Transport> AmlogicSession<T> {
     /// ZLP. Returns the bytes written; a short stream is not an error
     /// (NAND-backed streams end early on staging failure), transport
     /// errors propagate after the received prefix lands in `out`.
-    pub(crate) fn upload_stream(
-        &mut self,
-        total: usize,
-        out: &mut dyn Write,
-    ) -> Result<usize> {
+    pub(crate) fn upload_stream(&mut self, total: usize, out: &mut dyn Write) -> Result<usize> {
         self.receive_upload_to(total, &|| false, out, &|_| {}, false)
     }
 
@@ -729,7 +725,9 @@ impl<T: Transport> AmlogicSession<T> {
                     other => other,
                 })?;
             if actual == 0 {
-                log::warn!("store upload stopped with a ZLP at {received:#x} of {total:#x}; keeping a short image (announced {size:#x})");
+                log::warn!(
+                    "store upload stopped with a ZLP at {received:#x} of {total:#x}; keeping a short image (announced {size:#x})"
+                );
                 break;
             }
             received += actual;
@@ -987,7 +985,11 @@ mod tests {
             || {
                 let n = reads.get();
                 reads.set(n + 1);
-                if n < 2 { Ok(None) } else { Ok(Some("success".into())) }
+                if n < 2 {
+                    Ok(None)
+                } else {
+                    Ok(Some("success".into()))
+                }
             },
             || paused.get(),
             |delay| paused.set(paused.get() + delay),

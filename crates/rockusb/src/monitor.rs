@@ -2,7 +2,7 @@
 //! Port of wait_download_mode / rock_id from legacy/common.sh.
 
 use crate::error::Result;
-use crate::transport::{list_modes, DeviceMode};
+use crate::transport::{DeviceMode, list_modes};
 use std::time::{Duration, Instant};
 
 /// Bus poll interval (the mini loader window is < 1 s).
@@ -85,29 +85,29 @@ pub fn wait_download_mode(timeout: Option<Duration>, hint: &str) -> Result<Devic
     let mut hint_shown = false;
     loop {
         monitor.poll()?;
-        if let Some(mode) = DeviceMode::best(monitor.modes()) {
-            if matches!(
+        if let Some(mode) = DeviceMode::best(monitor.modes())
+            && matches!(
                 mode,
                 DeviceMode::Loader | DeviceMode::UsbPlug | DeviceMode::MaskRom
+            )
+        {
+            // the window can be short: make sure it persists
+            std::thread::sleep(DEBOUNCE);
+            let now = DeviceMode::best(&bus_modes());
+            if matches!(
+                now,
+                Some(DeviceMode::Loader | DeviceMode::UsbPlug | DeviceMode::MaskRom)
             ) {
-                // the window can be short: make sure it persists
-                std::thread::sleep(DEBOUNCE);
-                let now = DeviceMode::best(&bus_modes());
-                if matches!(
-                    now,
-                    Some(DeviceMode::Loader | DeviceMode::UsbPlug | DeviceMode::MaskRom)
-                ) {
-                    let label = now.as_ref().map(|m| m.label()).unwrap_or_default();
-                    log::info!("download mode stable: {label}");
-                    return Ok(now.unwrap());
-                }
-                log::warn!("download mode window closed within {DEBOUNCE:?} — try again");
+                let label = now.as_ref().map(|m| m.label()).unwrap_or_default();
+                log::info!("download mode stable: {label}");
+                return Ok(now.unwrap());
             }
+            log::warn!("download mode window closed within {DEBOUNCE:?} — try again");
         }
-        if let Some(t) = timeout {
-            if start.elapsed() >= t {
-                return Err(crate::error::Error::DeviceNotFound);
-            }
+        if let Some(t) = timeout
+            && start.elapsed() >= t
+        {
+            return Err(crate::error::Error::DeviceNotFound);
         }
         if !hint_shown {
             if !hint.is_empty() {
@@ -163,10 +163,10 @@ pub fn wait_gadget_stable(stable: Duration, timeout: Option<Duration>) -> Result
             }
             (false, None) => {}
         }
-        if let Some(t) = timeout {
-            if start.elapsed() >= t {
-                return Err(crate::error::Error::DeviceNotFound);
-            }
+        if let Some(t) = timeout
+            && start.elapsed() >= t
+        {
+            return Err(crate::error::Error::DeviceNotFound);
         }
         std::thread::sleep(POLL_INTERVAL);
     }

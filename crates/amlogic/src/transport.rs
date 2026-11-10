@@ -12,9 +12,9 @@
 //! assignment (the vendor update tool's driver or Zadig).
 
 use crate::error::{Error, Result};
+use nusb::MaybeFuture;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Direction, Recipient};
-use nusb::MaybeFuture;
 use std::io::{Read as _, Write as _};
 use std::time::Duration;
 

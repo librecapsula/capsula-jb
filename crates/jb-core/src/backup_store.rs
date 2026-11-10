@@ -81,28 +81,27 @@ impl BackupStore {
         if tsv.is_file() {
             for line in std::fs::read_to_string(&tsv)?.lines() {
                 let mut it = line.split('\t');
-                if let (Some(idx), Some(name)) = (it.next(), it.next()) {
-                    if let (Ok(idx), Some(name)) = (idx.parse::<u32>(), it.next().map(|_| name)) {
-                        let f = dir.join(Self::image_name(idx, name));
-                        if f.is_file() {
-                            files.insert(name.to_string(), f);
-                        }
+                if let (Some(idx), Some(name)) = (it.next(), it.next())
+                    && let (Ok(idx), Some(name)) = (idx.parse::<u32>(), it.next().map(|_| name))
+                {
+                    let f = dir.join(Self::image_name(idx, name));
+                    if f.is_file() {
+                        files.insert(name.to_string(), f);
                     }
                 }
             }
         } else {
             for e in std::fs::read_dir(dir)? {
                 let p = e?.path();
-                if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
-                    if n.ends_with(".img")
-                        && n.len() >= 6
-                        && n.as_bytes()[0].is_ascii_digit()
-                        && n.as_bytes()[1].is_ascii_digit()
-                        && n.as_bytes()[2] == b'_'
-                    {
-                        let part = n[3..n.len() - 4].to_string();
-                        files.insert(part, p);
-                    }
+                if let Some(n) = p.file_name().and_then(|n| n.to_str())
+                    && n.ends_with(".img")
+                    && n.len() >= 6
+                    && n.as_bytes()[0].is_ascii_digit()
+                    && n.as_bytes()[1].is_ascii_digit()
+                    && n.as_bytes()[2] == b'_'
+                {
+                    let part = n[3..n.len() - 4].to_string();
+                    files.insert(part, p);
                 }
             }
         }
@@ -213,6 +212,18 @@ pub struct CaptureDirectory {
     path: PathBuf,
 }
 
+/// mkdir with mode 0700 on unix (capture directories stay private).
+#[cfg(unix)]
+fn create_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
+}
+
 impl CaptureDirectory {
     /// Create a uniquely-named capture directory (tests and tools that
     /// need an ad-hoc capture location).
@@ -231,13 +242,7 @@ impl CaptureDirectory {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
+            match create_dir(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -255,13 +260,7 @@ impl CaptureDirectory {
         safe_capture_name(name)?;
         std::fs::create_dir_all(parent)?;
         let path = parent.join(name);
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&path)?;
+        create_dir(&path)?;
         Ok(Self { path })
     }
 
@@ -536,9 +535,11 @@ mod tests {
         let mut file = capture.create_file("boot.bin.partial").unwrap();
         file.write_all(b"new").unwrap();
         drop(file);
-        assert!(capture
-            .publish_partial("boot.bin.partial", "boot.bin")
-            .is_err());
+        assert!(
+            capture
+                .publish_partial("boot.bin.partial", "boot.bin")
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(capture.path().join("boot.bin")).unwrap(),
             b"old"

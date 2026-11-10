@@ -1,21 +1,21 @@
 //! Windows implementation: devnode scanning (setupapi), package
 //! installation (newdev + crypt32) and the supervisor thread.
 
-use crate::{log_line, Package, PACKAGES};
+use crate::{PACKAGES, Package, log_line};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA, SPDRP_HARDWAREID, SPDRP_SERVICE,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
     SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
-    UpdateDriverForPlugAndPlayDevicesW, DIGCF_ALLCLASSES, DIGCF_PRESENT, SPDRP_HARDWAREID,
-    SPDRP_SERVICE, SP_DEVINFO_DATA,
+    UpdateDriverForPlugAndPlayDevicesW,
 };
 use windows_sys::Win32::Foundation::{GetLastError, MAX_PATH};
 use windows_sys::Win32::Security::Cryptography::{
-    CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, CERT_STORE_ADD_USE_EXISTING,
-    CERT_STORE_NO_CRYPT_RELEASE_FLAG, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
-    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    CERT_STORE_ADD_USE_EXISTING, CERT_STORE_NO_CRYPT_RELEASE_FLAG, CERT_STORE_PROV_SYSTEM_W,
+    CERT_SYSTEM_STORE_LOCAL_MACHINE, CertAddEncodedCertificateToStore, CertCloseStore,
+    CertOpenStore, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows_sys::Win32::UI::Shell::IsUserAnAdmin;

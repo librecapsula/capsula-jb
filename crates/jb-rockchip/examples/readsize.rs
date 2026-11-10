@@ -14,17 +14,27 @@
 //!
 //!   cargo run -p jb-core --example readsize --release
 
-use jb_rockchip::backup::patch_read_limit;
 use jb_core::config::Config;
-use jb_rockchip::session::{bring_up, BringUpError, UsbBus};
+use jb_rockchip::backup::patch_read_limit;
+use jb_rockchip::session::{BringUpError, UsbBus, bring_up};
 
 fn main() -> anyhow::Result<()> {
     let config = Config::embedded();
     let loader = jb_rockchip::loader::embedded()?;
     let mut bus = UsbBus;
-    let up = match bring_up(&mut bus, &config, &loader, None, false, &|_| {}) {
+    let up = match bring_up(
+        &mut bus,
+        &config,
+        &loader,
+        None,
+        jb_rockchip::session::Goal::UsbPlug,
+        &|_| {},
+    ) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => anyhow::bail!("BootROM rejected the loader"),
+        Err(BringUpError::FirstGeneration { serial }) => anyhow::bail!(
+            "the BootROM refuses our loader ({serial}) — this probe needs our usbplug"
+        ),
         Err(e) => return Err(e.into()),
     };
     if up.firstgen {

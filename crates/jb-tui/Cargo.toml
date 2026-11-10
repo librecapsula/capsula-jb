@@ -1,0 +1,15 @@
+[package]
+name = "jb-tui"
+description = "capsula-jb — the terminal UI (all platforms): opens when the tool is launched without arguments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jb-core = { workspace = true }
+anyhow = { workspace = true }
+# std/alloc: this crate has no env_logger in its graph to turn the log
+# defaults on, and the bridge needs set_boxed_logger
+log = { workspace = true, features = ["std"] }
+ratatui = { workspace = true }

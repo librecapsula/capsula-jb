@@ -103,35 +103,35 @@ fn main() {
     }
 
     // ---- userdata: formatted? ----
-    if let Some(gpt) = gpt {
-        if let Some(e) = gpt.find("userdata") {
-            let mut head = vec![0u8; 2048];
-            match s.read_lba(e.first_lba as u32, &mut head) {
-                Ok(()) => {
-                    // ext2/3/4 superblock: offset 1024, magic 0xEF53 at +56
-                    let sb = &head[1024..];
-                    let magic = u16::from_le_bytes([sb[56], sb[57]]);
-                    println!(
-                        "userdata head:   ext2 magic {:#06x} ({})",
-                        magic,
-                        if magic == 0xef53 {
-                            "formatted"
-                        } else {
-                            "NOT ext"
-                        }
-                    );
+    if let Some(gpt) = gpt
+        && let Some(e) = gpt.find("userdata")
+    {
+        let mut head = vec![0u8; 2048];
+        match s.read_lba(e.first_lba as u32, &mut head) {
+            Ok(()) => {
+                // ext2/3/4 superblock: offset 1024, magic 0xEF53 at +56
+                let sb = &head[1024..];
+                let magic = u16::from_le_bytes([sb[56], sb[57]]);
+                println!(
+                    "userdata head:   ext2 magic {:#06x} ({})",
+                    magic,
                     if magic == 0xef53 {
-                        let blocks = u32::from_le_bytes(sb[4..8].try_into().unwrap());
-                        let log_bs = sb[24];
-                        let bs = 1024u64 << log_bs;
-                        println!(
-                            "                 block size {bs}, {blocks} blocks ({} MiB fs)",
-                            blocks as u64 * bs / 1024 / 1024
-                        );
+                        "formatted"
+                    } else {
+                        "NOT ext"
                     }
+                );
+                if magic == 0xef53 {
+                    let blocks = u32::from_le_bytes(sb[4..8].try_into().unwrap());
+                    let log_bs = sb[24];
+                    let bs = 1024u64 << log_bs;
+                    println!(
+                        "                 block size {bs}, {blocks} blocks ({} MiB fs)",
+                        blocks as u64 * bs / 1024 / 1024
+                    );
                 }
-                Err(err) => println!("userdata head:   ERR {err}"),
             }
+            Err(err) => println!("userdata head:   ERR {err}"),
         }
     }
     println!("diag done (strictly read-only, nothing was written)");

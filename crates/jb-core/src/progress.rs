@@ -2,7 +2,6 @@
 //! renders them (jb-cli renders step lines through the unified logger
 //! and partitions/transfers as indicatif bars).
 
-/// Progress events for CLI/GUI.
 #[derive(Debug, Clone)]
 pub enum Progress {
     /// A human-readable progress line.

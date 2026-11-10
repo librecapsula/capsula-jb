@@ -14,17 +14,17 @@
 //! the mount path takes the volume size, not the superblock's
 //! `leb_cnt` (fs/ubifs/super.c: `c->leb_cnt = c->vi.size`).
 
-use anyhow::{anyhow, ensure, Context, Result};
-use jb_core::overlay::{OverlayFile, LAYOUT_DIRS};
+use anyhow::{Context, Result, anyhow, ensure};
+use jb_core::overlay::{LAYOUT_DIRS, OverlayFile};
 use jb_core::progress::{Progress, ProgressFn};
 use std::path::Path;
+use ubifs::Compr;
 use ubifs::media::Superblock;
 use ubifs::mkfs;
 use ubifs::reader::Ubifs;
 use ubifs::tree::{Inode, Kind};
-use ubifs::ubi::{Dump, EcHeader, UbiGeometry, UBI_EC_HDR_SIZE};
+use ubifs::ubi::{Dump, EcHeader, UBI_EC_HDR_SIZE, UbiGeometry};
 use ubifs::ubinize;
-use ubifs::Compr;
 
 /// NAND geometry of the Mini: a PEB is 64 pages of 2 KiB (+64 B OOB).
 const PEB_SIZE: u32 = 128 * 1024;
@@ -39,7 +39,9 @@ const VOLUME_NAME: &str = "data";
 #[derive(Debug, thiserror::Error)]
 pub enum DataImageError {
     /// The capture did not parse as UBI/UBIFS — raw or unknown format.
-    #[error("захват data не читается как UBI/UBIFS: {0}.\n  если раздел не читается — запустите с --format-userdata")]
+    #[error(
+        "захват data не читается как UBI/UBIFS: {0}.\n  если раздел не читается — запустите с --format-userdata"
+    )]
     NotUbifs(String),
     #[error("UBI-образ раздела ({0} байт) не влезает в ёмкость {1}")]
     TooBig(u64, u64),
@@ -60,16 +62,16 @@ pub fn build_image(
     progress: ProgressFn,
 ) -> Result<()> {
     ensure!(
-        capacity > 0 && capacity % PEB_SIZE as u64 == 0,
+        capacity > 0 && capacity.is_multiple_of(PEB_SIZE as u64),
         "ёмкость раздела не кратна PEB ({capacity} байт)"
     );
-    if let Some(dump) = base {
-        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(dump), std::fs::canonicalize(out)) {
-            ensure!(
-                a != b,
-                "пути захвата и результата совпадают — захват не модифицируется"
-            );
-        }
+    if let Some(dump) = base
+        && let (Ok(a), Ok(b)) = (std::fs::canonicalize(dump), std::fs::canonicalize(out))
+    {
+        ensure!(
+            a != b,
+            "пути захвата и результата совпадают — захват не модифицируется"
+        );
     }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
@@ -220,7 +222,10 @@ pub fn build_image(
     let mut out_bytes = ubi;
     while (out_bytes.len() as u64) < capacity {
         out_bytes.extend_from_slice(&header);
-        out_bytes.extend(std::iter::repeat(0xFF).take((PEB_SIZE as usize) - UBI_EC_HDR_SIZE));
+        out_bytes.extend(std::iter::repeat_n(
+            0xFF,
+            (PEB_SIZE as usize) - UBI_EC_HDR_SIZE,
+        ));
     }
     debug_assert_eq!(out_bytes.len() as u64, capacity);
     std::fs::write(out, &out_bytes)?;
@@ -430,7 +435,10 @@ mod tests {
         .to_bytes();
         while (raw.len() as u64) < CAPACITY {
             raw.extend_from_slice(&header);
-            raw.extend(std::iter::repeat(0xFF).take((PEB_SIZE as usize) - UBI_EC_HDR_SIZE));
+            raw.extend(std::iter::repeat_n(
+                0xFF,
+                (PEB_SIZE as usize) - UBI_EC_HDR_SIZE,
+            ));
         }
         let path = dir.join("capture-data.bin");
         std::fs::write(&path, &raw).unwrap();

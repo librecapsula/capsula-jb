@@ -135,7 +135,7 @@ impl<T: Transport> AmlogicSession<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{req, MockTransport, Step};
+    use crate::{MockTransport, Step, req};
 
     fn command(text: &str) -> Vec<u8> {
         let mut payload = vec![0; 64];

@@ -72,13 +72,13 @@ pub const PACKAGES: &[&Package] = &[&PACKAGE_330D, &PACKAGE_330E];
 mod sys;
 
 #[cfg(windows)]
-pub use sys::{fix_cwd_if_system32, pause_if_own_console, Session};
+pub use sys::{Session, fix_cwd_if_system32, pause_if_own_console};
 
 #[cfg(not(windows))]
 mod stub;
 
 #[cfg(not(windows))]
-pub use stub::{fix_cwd_if_system32, pause_if_own_console, Session};
+pub use stub::{Session, fix_cwd_if_system32, pause_if_own_console};
 
 /// Does this error message look like "the devnode is bound to a wrong
 /// driver"? nusb reports a non-WinUSB binding as "incompatible driver

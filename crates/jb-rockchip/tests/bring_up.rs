@@ -5,8 +5,8 @@
 
 use jb_core::config::Config;
 use jb_core::progress::Progress;
-use jb_rockchip::session::{bring_up, BringUpError, Bus};
-use rockusb::loader::{opcode, LoaderSession};
+use jb_rockchip::session::{BringUpError, Bus, Goal, bring_up};
+use rockusb::loader::{LoaderSession, opcode};
 use rockusb::mock::{MockTransport, Step};
 use rockusb::{DeviceMode, LoaderContainer};
 use std::collections::VecDeque;
@@ -71,7 +71,7 @@ fn synth_loader() -> LoaderContainer {
     buf[25] = 1; // n471
     buf[31] = 1; // n472
     buf[44] = 1; // rc4_flag != 0 -> RC4 off
-                 // entry 0: DDR init (0x471)
+    // entry 0: DDR init (0x471)
     buf[HEADER_SIZE + 1..HEADER_SIZE + 5].copy_from_slice(&1u32.to_le_bytes());
     buf[HEADER_SIZE + 45..HEADER_SIZE + 49].copy_from_slice(&(DATA_OFF as u32).to_le_bytes());
     buf[HEADER_SIZE + 49..HEADER_SIZE + 53].copy_from_slice(&(ddra.len() as u32).to_le_bytes());
@@ -268,17 +268,22 @@ impl Bus for FakeBus {
 
 fn run(
     bus: &mut FakeBus,
-    no_backup: bool,
+    stock_loader_goal: bool,
 ) -> Result<jb_rockchip::session::BroughtUp<MockTransport>, BringUpError> {
     let config = Config::embedded();
     let loader = synth_loader();
     let progress = |_: Progress| {};
+    let goal = if stock_loader_goal {
+        Goal::StockLoader
+    } else {
+        Goal::UsbPlug
+    };
     bring_up(
         bus,
         &config,
         &loader,
         Some(Duration::from_secs(30)),
-        no_backup,
+        goal,
         &progress,
     )
 }
@@ -309,12 +314,36 @@ fn regular_column_goes_through_maskrom_to_usbplug() {
     assert_eq!(bus.serial_reads, 1);
 }
 
+/// Under Goal::UsbPlug the first generation is the CALLER's decision,
+/// not bring-up's: the gift serial is reported as FirstGeneration
+/// without touching the board (no MaskROM reset — the loader scenario
+/// holds only the stock probe).
+#[test]
+fn first_generation_under_usbplug_goal_names_the_column() {
+    let mut bus = FakeBus::new(vec![Some(DeviceMode::Loader)], GIFT_SERIAL)
+        .with_loader(vec![stock_probe_steps()]);
+
+    let err = match run(&mut bus, false) {
+        Ok(_) => panic!("первое поколение должно стать FirstGeneration"),
+        Err(e) => e,
+    };
+    match err {
+        BringUpError::FirstGeneration { serial } => assert_eq!(serial, GIFT_SERIAL),
+        other => panic!("не тот исход: {other}"),
+    }
+    // no MaskROM reset ever happened on the first-generation path
+    assert_eq!(bus.serial_reads, 1);
+}
+
+/// The degraded re-connect (Goal::StockLoader) attaches the stock
+/// loader for the first generation: `firstgen = true`, the session is
+/// the 330d persona itself.
 #[test]
 fn first_generation_sticks_to_the_stock_loader() {
     let mut bus = FakeBus::new(vec![Some(DeviceMode::Loader)], GIFT_SERIAL)
         .with_loader(vec![stock_probe_steps()]);
 
-    let up = run(&mut bus, false).expect("bring-up");
+    let up = run(&mut bus, true).expect("bring-up");
     assert!(up.firstgen);
     assert_eq!(up.serial, GIFT_SERIAL);
     // no MaskROM reset ever happens on the first-generation path
@@ -337,79 +366,56 @@ fn no_backup_regular_column_sticks_to_the_stock_loader() {
     assert_eq!(bus.serial_reads, 1);
 }
 
+/// An unreadable loader serial (a broken read or a gadget fallback of
+/// zeros) is a fatal refusal: the persona cannot be keyed to a column,
+/// so bring_up errors out — the caller's reconnect round-trip asks the
+/// user for a loader re-entry.
 #[test]
-fn unreadable_serial_refuses_then_recovers_on_reentry() {
-    let config = Config::embedded();
-    let mut bus = FakeBus {
-        // first recognition reports zeros (broken read), then a real
-        // serial after the re-entry
-        serials: VecDeque::from(["000000000".to_string(), REGULAR_SERIAL.to_string()]),
-        polls: vec![
-            Some(DeviceMode::Loader),
-            None,
-            Some(DeviceMode::Loader),
-            Some(DeviceMode::MaskRom),
-        ]
-        .into(),
-        loader_scenarios: vec![probe_and_reset_steps(0x03), signature_steps(&config)].into(),
-        maskrom_scenario: maskrom_download_steps(),
-        wait_mode_results: VecDeque::new(),
-        serial_reads: 0,
+fn unreadable_serial_is_an_unknown_identity_error() {
+    let mut bus = FakeBus::new(vec![Some(DeviceMode::Loader)], "000000000");
+    let err = match run(&mut bus, false) {
+        Ok(_) => panic!("несчитанный серийник — bring_up должен отказать"),
+        Err(e) => e,
     };
-
-    let up = run(&mut bus, false).expect("bring-up after re-entry");
-    assert!(!up.firstgen);
-    assert_eq!(up.serial, REGULAR_SERIAL);
-    assert_eq!(bus.serial_reads, 2);
-}
-
-#[test]
-fn leftover_usbplug_is_refused_until_loader_reentry() {
-    let config = Config::embedded();
-    let mut bus = FakeBus {
-        serials: VecDeque::from([REGULAR_SERIAL.to_string()]),
-        polls: vec![
-            Some(DeviceMode::UsbPlug),
-            Some(DeviceMode::Loader),
-            Some(DeviceMode::MaskRom),
-        ]
-        .into(),
-        loader_scenarios: vec![probe_and_reset_steps(0x03), signature_steps(&config)].into(),
-        maskrom_scenario: maskrom_download_steps(),
-        wait_mode_results: VecDeque::new(),
-        serial_reads: 0,
-    };
-
-    let up = run(&mut bus, false).expect("bring-up after re-entry");
-    assert!(!up.firstgen);
-    // the usbplug persona never contributed a serial
+    assert!(matches!(err, BringUpError::UnknownIdentity));
+    // the message carries the loader re-entry instruction
+    assert!(err.to_string().contains("режим лоадера"), "{err}");
     assert_eq!(bus.serial_reads, 1);
 }
 
+/// A leftover usbplug from a previous run identifies nothing: a fatal
+/// refusal, the serial is never read from it.
 #[test]
-fn direct_maskrom_entry_without_serial_is_refused() {
-    let config = Config::embedded();
-    let mut bus = FakeBus {
-        serials: VecDeque::from([REGULAR_SERIAL.to_string()]),
-        polls: vec![
-            Some(DeviceMode::MaskRom), // direct entry: no serial yet
-            Some(DeviceMode::Loader),
-            Some(DeviceMode::MaskRom),
-        ]
-        .into(),
-        loader_scenarios: vec![probe_and_reset_steps(0x03), signature_steps(&config)].into(),
-        maskrom_scenario: maskrom_download_steps(),
-        wait_mode_results: VecDeque::new(),
-        serial_reads: 0,
+fn leftover_usbplug_is_an_unknown_identity_error() {
+    let mut bus = FakeBus::new(vec![Some(DeviceMode::UsbPlug)], REGULAR_SERIAL);
+    let err = match run(&mut bus, false) {
+        Ok(_) => panic!("живой usbplug без истории — bring_up должен отказать"),
+        Err(e) => e,
     };
-
-    let up = run(&mut bus, false).expect("bring-up after loader re-entry");
-    assert_eq!(up.serial, REGULAR_SERIAL);
-    assert_eq!(bus.serial_reads, 1);
+    assert!(matches!(err, BringUpError::UnknownIdentity));
+    assert_eq!(bus.serial_reads, 0);
 }
 
+/// A direct MaskROM entry carries no serial: a fatal refusal.
 #[test]
-fn usbplug_never_rising_is_loader_rejected() {
+fn direct_maskrom_entry_is_an_unknown_identity_error() {
+    let mut bus = FakeBus::new(vec![Some(DeviceMode::MaskRom)], REGULAR_SERIAL);
+    let err = match run(&mut bus, false) {
+        Ok(_) => panic!("прямой вход в MaskROM — bring_up должен отказать"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, BringUpError::UnknownIdentity));
+    assert_eq!(bus.serial_reads, 0);
+}
+
+/// The board reached MaskROM (the pipe is fine), the loader was
+/// downloaded — but the usbplug persona never appeared within the
+/// wait: an incompatible-batch BootROM silently dropped it. Under
+/// Goal::UsbPlug that is FirstGeneration naming the column (the caller
+/// asks the user and re-connects over the stock loader); the raw
+/// LoaderRejected stays internal to reattach.
+#[test]
+fn usbplug_never_rising_is_first_generation() {
     let mut bus = FakeBus::new(
         vec![Some(DeviceMode::Loader), Some(DeviceMode::MaskRom)],
         REGULAR_SERIAL,
@@ -420,10 +426,37 @@ fn usbplug_never_rising_is_loader_rejected() {
     .with_wait_results(vec![true, false]);
 
     let err = match run(&mut bus, false) {
-        Ok(_) => panic!("usbplug never rose — bring_up must be rejected"),
+        Ok(_) => panic!("usbplug never rose — bring_up must fail"),
         Err(e) => e,
     };
-    assert!(matches!(err, BringUpError::LoaderRejected), "{err}");
+    match err {
+        BringUpError::FirstGeneration { serial } => assert_eq!(serial, REGULAR_SERIAL),
+        other => panic!("не тот исход: {other}"),
+    }
+}
+
+/// The locked BootROM throws the loader out over the wire (the control
+/// transfer is reset): the download fails before any wait — the same
+/// FirstGeneration outcome as the persona never appearing.
+#[test]
+fn download_rejected_on_the_wire_is_first_generation() {
+    let mut bus = FakeBus::new(
+        vec![Some(DeviceMode::Loader), Some(DeviceMode::MaskRom)],
+        REGULAR_SERIAL,
+    )
+    .with_loader(vec![probe_and_reset_steps(0x03)])
+    // the empty maskrom scenario rejects the first control transfer
+    .with_maskrom(vec![])
+    .with_wait_results(vec![true]);
+
+    let err = match run(&mut bus, false) {
+        Ok(_) => panic!("download отвергнут — bring_up must fail"),
+        Err(e) => e,
+    };
+    match err {
+        BringUpError::FirstGeneration { serial } => assert_eq!(serial, REGULAR_SERIAL),
+        other => panic!("не тот исход: {other}"),
+    }
 }
 
 #[test]
@@ -447,5 +480,8 @@ fn wrong_dram_signatures_fail_the_bring_up() {
         Ok(_) => panic!("wrong signatures — bring_up must fail"),
         Err(e) => e,
     };
-    assert!(err.to_string().contains("сигнатуры"), "{err}");
+    assert!(
+        err.to_string().contains("проверка загрузчика не сошлась"),
+        "{err}"
+    );
 }

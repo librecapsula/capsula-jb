@@ -4,7 +4,7 @@
 
 use amlogic::req;
 use amlogic::session::{BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK};
-use amlogic::{soc::Stage, AmlogicSession, Error, SocId};
+use amlogic::{AmlogicSession, Error, SocId, soc::Stage};
 use amlogic::{MockTransport, Step};
 use std::time::Duration;
 
@@ -554,20 +554,14 @@ fn read_nand_range_steps() {
         req::BULKCMD,
         0,
         2,
-        bulkcmd(&format!(
-            "echo; mw.b 0x1080000 0xa5 {:#x}",
-            stage
-        )),
+        bulkcmd(&format!("echo; mw.b 0x1080000 0xa5 {:#x}", stage)),
     ));
     steps.push(Step::BulkIn(ok.clone()));
     steps.push(Step::ControlOut(
         req::BULKCMD,
         0,
         2,
-        bulkcmd(&format!(
-            "echo; nand read 0x1080000 0xb200000 {:#x}",
-            stage
-        )),
+        bulkcmd(&format!("echo; nand read 0x1080000 0xb200000 {:#x}", stage)),
     ));
     steps.push(Step::BulkIn(ok.clone()));
     // one arm for the whole stage at the scratch address
@@ -575,10 +569,7 @@ fn read_nand_range_steps() {
         req::BULKCMD,
         0,
         2,
-        bulkcmd(&format!(
-            "upload mem 0x1080000 normal {:#x}",
-            stage
-        )),
+        bulkcmd(&format!("upload mem 0x1080000 normal {:#x}", stage)),
     ));
     steps.push(Step::BulkIn(ok));
     // the device announces min(left, 64 KiB) per burst

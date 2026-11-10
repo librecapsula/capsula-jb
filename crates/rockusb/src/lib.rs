@@ -16,8 +16,8 @@
 //!   330d > usbplug > maskrom, debounce (port of common.sh).
 //!
 //! Everything Rockchip-vendor-specific lives inside this crate; jb-core
-//! talks to abstractions, and a second backend (Amlogic) will be added
-//! later as a separate crate on the same principle.
+//! talks to abstractions — the Amlogic backend is a separate crate on
+//! the same principle.
 
 pub mod error;
 pub mod loader;
@@ -34,7 +34,7 @@ pub use loader_container::LoaderContainer;
 pub use maskrom::MaskRomSession;
 pub use monitor::DeviceMonitor;
 pub use transport::{
-    current_mode, device_serial, list_modes, DeviceMode, NusbTransport, Transport,
+    DeviceMode, NusbTransport, Transport, current_mode, device_serial, list_modes,
 };
 
 /// USB VID of all Rockchip modes.

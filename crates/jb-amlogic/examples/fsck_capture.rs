@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
         Some(Path::new(&capture)),
         Path::new(&out),
         capacity,
-        &overlay_files(format!("capsula-jb fsck {}\n", std::process::id())),
+        &overlay_files(format!("capsula-jb fsck {}\n", std::process::id()), true),
         &progress,
     )
     .context("сборка патченного образа")?;

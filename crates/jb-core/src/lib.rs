@@ -9,14 +9,18 @@
 //! The dependency layers: jb-cli (the binary: arguments, dispatch, UI)
 //! → jb-rockchip / jb-amlogic (the platform domains and their
 //! Backend+Platform implementations) → this crate (the contract:
-//! `backend`, the scenario skeleton `scenario`, progress events,
-//! the overlay file set, the capture storage, the config). This crate
-//! knows no transports and no platforms.
+//! `backend`, the speaker model registry `model`, the scenario
+//! skeleton `scenario`, progress events, the overlay file set, the
+//! capture storage, the config). This crate knows no transports and
+//! no platforms.
 
 pub mod backend;
+pub mod backup_catalog;
 pub mod backup_store;
 pub mod config;
 pub mod format;
+pub mod model;
 pub mod overlay;
 pub mod progress;
 pub mod scenario;
+pub mod session;

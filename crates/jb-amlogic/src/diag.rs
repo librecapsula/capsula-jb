@@ -7,7 +7,7 @@
 //! the window without a power cycle.
 
 use crate::platform::{bring_up, open_and_identify, require_tpl};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use jb_core::progress::ProgressFn;
 use std::time::{Duration, Instant};
 
@@ -153,9 +153,9 @@ pub fn passthrough(wait: Option<Duration>, cmds: &[String], progress: ProgressFn
                 let soc = s.identify()?;
                 let t_chunk = Instant::now();
                 let off = 0x100_0000u32 + (i - 1) * size as u32; // misc/boot_a/system — a readable zone
-                                                                 // flasher.sh read_big_from_flash mechanics: one
-                                                                 // blocking `nand read` (the status read absorbs the
-                                                                 // staging silence) + one `upload mem` stream
+                // flasher.sh read_big_from_flash mechanics: one
+                // blocking `nand read` (the status read absorbs the
+                // staging silence) + one `upload mem` stream
                 let data = s
                     .nand_read(amlogic::RAM_SCRATCH, off, size)
                     .and_then(|_| s.read_dram(amlogic::RAM_SCRATCH, size, &|_| {}));
@@ -171,7 +171,11 @@ pub fn passthrough(wait: Option<Duration>, cmds: &[String], progress: ProgressFn
                         log::error!(
                             "readtest {i}/{n}: кусок не прошёл на {} мс ({e}); устройство {}",
                             t_chunk.elapsed().as_millis(),
-                            if on_bus { "на шине" } else { "пропало" }
+                            if on_bus {
+                                "на шине"
+                            } else {
+                                "пропало"
+                            }
                         );
                         anyhow::bail!("readtest прерван на куске {i}");
                     }

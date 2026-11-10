@@ -19,8 +19,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      # the runners ship a Rust stable toolchain; only add the pieces
+      # its minimal profile lacks
+      - name: Add clippy
+        run: rustup component add clippy
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
@@ -32,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+      - name: Add rustfmt
+        run: rustup component add rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check

@@ -13,6 +13,14 @@
 
 /// Is this USB serial a first-generation column?
 pub fn is_first_generation(serial: &str) -> bool {
+    // TEST-ONLY bypass: with CAPSULA_JB_TEST_IGNORE_FIRSTGEN set the
+    // serial rule reports "regular" at every call site (the bring_up
+    // early exit, the degraded-flow notice, the identity flag), so the
+    // flow really attempts the MaskROM round-trip and the usbplug
+    // download and exercises the loader-failure handling end to end.
+    if std::env::var_os("CAPSULA_JB_TEST_IGNORE_FIRSTGEN").is_some() {
+        return false;
+    }
     !serial.chars().take(4).all(|c| c.is_ascii_digit())
 }
 

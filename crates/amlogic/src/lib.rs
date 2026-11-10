@@ -54,9 +54,9 @@ pub use checksum::add_sum;
 pub use error::{Error, Result};
 pub use mock::{MockTransport, Step};
 pub use session::{
-    AmlogicSession, BULKCMD_MAX, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK, UPLOAD_SLOT,
+    AmlogicSession, BULK_REPLY_LEN, BULKCMD_MAX, MEDIA_ACK_LEN, MEDIA_CHUNK, UPLOAD_SLOT,
 };
-pub use soc::{SocId, Stage, STAGE_MINOR_IPL, STAGE_MINOR_SPL, STAGE_MINOR_TPL};
+pub use soc::{STAGE_MINOR_IPL, STAGE_MINOR_SPL, STAGE_MINOR_TPL, SocId, Stage};
 pub use transport::{NusbTransport, Transport};
 
 /// USB VID of all Amlogic download modes.

@@ -1,7 +1,7 @@
 //! Read-path regressions: the USB boundary is mocked, the protocol and
 //! writer (including its partial/error behavior) are real.
 
-use amlogic::{req, AmlogicSession, Error};
+use amlogic::{AmlogicSession, Error, req};
 use amlogic::{MockTransport, Step};
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -137,9 +137,10 @@ fn upload_rejects_burst_larger_than_remaining_before_bulk() {
     ]);
     let mut s = session(steps);
     let mut out = Vec::new();
-    assert!(s
-        .upload_store_to("bootloader", 513, &mut out, &|_| {})
-        .is_err());
+    assert!(
+        s.upload_store_to("bootloader", 513, &mut out, &|_| {})
+            .is_err()
+    );
     assert!(out.is_empty());
     assert_eq!(s.transport().pos, 3);
 }
@@ -149,9 +150,10 @@ fn upload_rejects_short_head_before_bulk() {
     let mut steps = armed("upload store bootloader normal 0x4");
     steps.push(Step::ControlIn(req::READ_MEDIA, 4096, 1, vec![0; 15]));
     let mut s = session(steps);
-    assert!(s
-        .upload_store_to("bootloader", 4, &mut Vec::new(), &|_| {})
-        .is_err());
+    assert!(
+        s.upload_store_to("bootloader", 4, &mut Vec::new(), &|_| {})
+            .is_err()
+    );
     assert_eq!(s.transport().pos, 3);
 }
 
@@ -165,9 +167,10 @@ fn upload_zero_payload_packet_is_error_with_prefix_retained() {
     ]);
     let mut s = session(steps);
     let mut out = Vec::new();
-    assert!(s
-        .upload_store_to("bootloader", 4, &mut out, &|_| {})
-        .is_err());
+    assert!(
+        s.upload_store_to("bootloader", 4, &mut out, &|_| {})
+            .is_err()
+    );
     assert_eq!(out, b"ab");
 }
 
@@ -247,9 +250,10 @@ fn upload_rejects_unknown_partition_and_oversized_range_before_usb() {
         ),
     ] {
         let mut s = session(armed(text));
-        assert!(s
-            .upload_store_to(name, size, &mut Vec::new(), &|_| {})
-            .is_err());
+        assert!(
+            s.upload_store_to(name, size, &mut Vec::new(), &|_| {})
+                .is_err()
+        );
         assert_eq!(s.transport().pos, 0);
     }
 }
@@ -387,9 +391,10 @@ fn upload_store_empty_first_burst_is_error() {
         Step::BulkIn(vec![]),
     ]);
     let mut s = session(steps);
-    assert!(s
-        .upload_store_to("data", 65536, &mut Vec::new(), &|_| {})
-        .is_err());
+    assert!(
+        s.upload_store_to("data", 65536, &mut Vec::new(), &|_| {})
+            .is_err()
+    );
 }
 
 #[test]

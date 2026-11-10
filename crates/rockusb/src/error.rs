@@ -26,7 +26,9 @@ pub enum Error {
     /// stopped responding (a wedged loader). Carries the details needed
     /// to analyze the hang: what was being transferred, on which
     /// endpoint, and for how long there was no answer.
-    #[error("{what}: нет ответа от устройства за {waited:?} (ep {endpoint:#x}, {len} байт) — похоже, завис лоадер")]
+    #[error(
+        "{what}: нет ответа от устройства за {waited:?} (ep {endpoint:#x}, {len} байт) — похоже, завис лоадер"
+    )]
     Timeout {
         what: String,
         endpoint: u8,
