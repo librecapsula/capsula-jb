@@ -1,9 +1,9 @@
 //! The TUI application state: the screen machine (model select →
-//! waiting → main) and the session-event handling. The session worker
-//! starts only when the model is committed — it polls exactly that
-//! model's backend. Plain data + methods, testable without a
-//! terminal; the input routing lives in [`input`], the tests in
-//! [`tests`].
+//! waiting → preparing → main, with a first-generation modal on the
+//! way) and the session-event handling. The session worker starts only
+//! when the model is committed — it polls exactly that model's
+//! backend. Plain data + methods, testable without a terminal; the
+//! input routing lives in [`input`], the tests in [`tests`].
 
 pub mod input;
 #[cfg(test)]
@@ -27,6 +27,12 @@ const LOG_CAP: usize = 2000;
 pub enum Screen {
     ModelSelect,
     Waiting,
+    /// A device showed up and the worker is bringing it up (loader
+    /// download, driver installs — potentially tens of seconds); the
+    /// live bring-up log is the content. Leaves for [`Screen::Main`]
+    /// (connected), the first-gen modal (degraded flow) or back to
+    /// [`Screen::Waiting`] after a declined attention.
+    Preparing,
     Main,
 }
 
@@ -103,6 +109,14 @@ pub enum Confirm {
     /// until the reply).
     Write {
         plan: WritePlan,
+        reply: Option<Sender<jb_core::session::Decision>>,
+    },
+    /// The connect hit the degraded flow (rockchip first generation /
+    /// an incompatible batch): the user must consent to "no full
+    /// backup" (the worker is BLOCKED until the reply). Continue =
+    /// wait for the stock loader persona only; Esc aborts the run.
+    Firstgen {
+        notice: Vec<String>,
         reply: Option<Sender<jb_core::session::Decision>>,
     },
     /// Local: delete the backup directory.
@@ -209,6 +223,14 @@ impl App {
                     self.hints = hints;
                 }
             }
+            Event::Connecting => {
+                // a device is on the bus — the bring-up runs on the
+                // worker; keep Main (a reconnect never happens past
+                // it) and stay put otherwise
+                if self.screen != Screen::Main {
+                    self.screen = Screen::Preparing;
+                }
+            }
             Event::DeviceConnected { identity } => {
                 // The worker polls only the chosen model's backend, so
                 // the identity is that model by construction — no
@@ -233,6 +255,18 @@ impl App {
             Event::ConfirmRequested { plan, reply } => {
                 self.confirm = Some(Confirm::Write {
                     plan,
+                    reply: Some(reply),
+                });
+                self.focus = Focus::ModalOk;
+            }
+            Event::AttentionRequested { notice, reply } => {
+                // Degraded flow (first generation): the worker blocks
+                // on the answer. Behind the modal the waiting screen
+                // shows the loader-mode hints — after "continue" the
+                // column has to re-enter 330d.
+                self.screen = Screen::Waiting;
+                self.confirm = Some(Confirm::Firstgen {
+                    notice,
                     reply: Some(reply),
                 });
                 self.focus = Focus::ModalOk;

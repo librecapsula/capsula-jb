@@ -32,6 +32,9 @@ fn main() -> anyhow::Result<()> {
     ) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => anyhow::bail!("BootROM rejected the loader"),
+        Err(BringUpError::FirstGeneration { serial }) => anyhow::bail!(
+            "the BootROM refuses our loader ({serial}) — this probe needs our usbplug"
+        ),
         Err(e) => return Err(e.into()),
     };
     if up.firstgen {

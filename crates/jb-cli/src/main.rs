@@ -204,6 +204,9 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
                     log::info!("{h}");
                 }
             }
+            Ok(Event::Connecting) => {
+                log::info!("устройство найдено — подготавливаю колонку…")
+            }
             Ok(Event::DeviceConnected { identity }) => {
                 log::info!("колонка: {} ({})", identity.key, identity.model.label())
             }
@@ -220,6 +223,17 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
                     let _ = reply.send(Decision::Abort);
                 }
             },
+            Ok(Event::AttentionRequested { notice, reply }) => {
+                match confirm_attention(&notice, cli.yes) {
+                    Ok(()) => {
+                        let _ = reply.send(Decision::Proceed);
+                    }
+                    Err(e) => {
+                        abort_reason = Some(e);
+                        let _ = reply.send(Decision::Abort);
+                    }
+                }
+            }
             Ok(Event::Finished(result)) => {
                 return match (result, abort_reason) {
                     (Err(e), Some(reason)) if e.to_string() == "прервано пользователем" => {
@@ -254,6 +268,26 @@ fn confirm_write(plan: &WritePlan, yes: bool) -> anyhow::Result<()> {
     );
     log::info!("продолжить? [y/N]");
     ask_yes("записи", "ничего не записано")
+}
+
+/// The degraded-flow consent (rockchip: the connect could not run our
+/// loader — the first generation or an incompatible batch, the full
+/// backup is impossible). On "continue" the worker waits for the stock
+/// loader re-entry and connects again; a refusal ends the run with
+/// nothing touched.
+fn confirm_attention(notice: &[String], yes: bool) -> anyhow::Result<()> {
+    for line in notice {
+        log::info!("{line}");
+    }
+    if yes {
+        log::info!("--yes: продолжаю без полного бэкапа");
+        return Ok(());
+    }
+    log::info!("продолжить без полного бэкапа? [y/N]");
+    ask_yes(
+        "продолжения без полного бэкапа",
+        "на колонку не писалось, бэкап не снимался",
+    )
 }
 
 /// Both stdin and stdout are terminals — a human at a console (the

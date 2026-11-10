@@ -38,13 +38,19 @@ impl Focus {
             Some(_) => MODAL.to_vec(),
             None => match app.screen {
                 Screen::ModelSelect => (0..Model::ALL.len()).map(Focus::Model).collect(),
-                _ => MAIN.to_vec(),
+                // the bring-up runs on the worker — nothing to focus
+                Screen::Preparing => vec![],
+                Screen::Waiting | Screen::Main => MAIN.to_vec(),
             },
         }
     }
 
     fn next(app: &App, backwards: bool) -> Focus {
         let ring = Self::ring(app);
+        if ring.is_empty() {
+            // a control-less screen (Preparing): the focus stays put
+            return app.focus;
+        }
         let pos = ring.iter().position(|f| *f == app.focus).unwrap_or(0);
         let delta = if backwards {
             ring.len().wrapping_sub(1)
@@ -165,8 +171,9 @@ impl App {
         match self.screen {
             Screen::ModelSelect => self.quit = true,
             // Changing the model = a full restart of the tool; the
-            // waiting screen only exits.
-            Screen::Waiting | Screen::Main => self.request_quit(),
+            // waiting/preparing screens only exit. Quitting during the
+            // bring-up is safe — nothing is being written yet.
+            Screen::Waiting | Screen::Preparing | Screen::Main => self.request_quit(),
         }
     }
 
@@ -236,11 +243,16 @@ impl App {
                 }
             }
             Focus::ModalOk => match self.confirm.take() {
-                Some(Confirm::Write { reply, .. }) => {
+                // Proceed on both: the write goes ahead; the degraded
+                // connect re-waits for the device (the stock loader
+                // persona only) and connects again
+                Some(Confirm::Write { reply, .. }) | Some(Confirm::Firstgen { reply, .. }) => {
                     if let Some(reply) = reply {
                         let _ = reply.send(jb_core::session::Decision::Proceed);
                     }
-                    self.focus = Focus::Flash;
+                    if self.screen == Screen::Main {
+                        self.focus = Focus::Flash;
+                    }
                 }
                 Some(Confirm::DeleteBackup { dir }) => {
                     match std::fs::remove_dir_all(&dir) {
@@ -268,13 +280,16 @@ impl App {
         self.hints = vec![crate::hint_text(self.selected_model).to_string()];
     }
 
-    /// Answer the write confirm with Abort (or just drop a local
-    /// modal).
+    /// Answer the write/first-gen confirm with Abort (or just drop a
+    /// local modal).
     fn cancel_confirm(&mut self) {
-        if let Some(Confirm::Write { reply, .. }) = self.confirm.take()
-            && let Some(reply) = reply
-        {
-            let _ = reply.send(jb_core::session::Decision::Abort);
+        match self.confirm.take() {
+            Some(Confirm::Write { reply, .. }) | Some(Confirm::Firstgen { reply, .. }) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(jb_core::session::Decision::Abort);
+                }
+            }
+            Some(Confirm::DeleteBackup { .. }) | None => {}
         }
         if self.screen == Screen::Main {
             self.focus = Focus::Flash;

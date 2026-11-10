@@ -311,7 +311,7 @@ fn backup_pipeline_on_mock() {
 
     // the report carries the streamed checksums of every image
     assert_eq!(report.images.len(), 2);
-    assert!(report.masked.is_empty());
+    assert!(report.skipped.is_empty());
     let expected_sum = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -507,17 +507,21 @@ fn write_partition_is_chunked_with_progress() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Stock loader (first generation): no RAM patch, no guard — the dump
-/// runs anyway. Partitions from GUARD_LBA up come back as 0xCC (fully
-/// above the mask) or lose their tail (straddling, boot_b-like); the
-/// store stays verifiable, the run must warn about it.
+/// Stock loader (the degraded flow): no RAM patch, no guard — the dump
+/// runs anyway. The capture cuts at boot_a: everything from it up
+/// (INCLUDING boot_a itself, fully below the read mask) and everything
+/// reaching past GUARD_LBA (fully above the mask, or straddling it
+/// like boot_b) is NOT dumped — the names land in the report's
+/// `skipped`, only the partitions before boot_a are imaged, and the
+/// run warns about the partial backup.
 #[test]
-fn backup_on_stock_loader_keeps_masked_partitions() {
+fn backup_on_stock_loader_skips_from_boot_a() {
     use jb_core::progress::Progress;
 
     const GUARD: u64 = GUARD_LBA as u64;
     let entries = [
-        ("low", 512, 514),                  // fully below the mask
+        ("low", 512, 514),                  // fully below the cut — dumped
+        ("boot_a", 1024, 2047),             // below the mask, AT the cut
         ("straddle", GUARD - 2, GUARD + 1), // crosses GUARD like boot_b
         ("high", GUARD + 16, GUARD + 17),   // fully above the mask
     ];
@@ -525,10 +529,7 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
 
     // real flash content below the mask, 0xCC above it
     let real = |lba: u64| -> Vec<u8> { (0..512).map(|i| (lba as usize * 7 + i) as u8).collect() };
-    let cc = vec![0xccu8; 512];
     let low_reply = [real(512), real(513), real(514)].concat();
-    let straddle_reply = [real(GUARD - 2), real(GUARD - 1), cc.clone(), cc.clone()].concat();
-    let high_reply = [cc.clone(), cc.clone()].concat();
 
     let mut steps = Vec::new();
     let mut tag = 0x5a5a0000u32;
@@ -595,7 +596,7 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
     steps.push(Step::BulkIn(vec![0x2c, 0x64, 0x90, 0xa5, 0x76]));
     steps.push(Step::BulkIn(csw(tag)));
 
-    // low (3 sectors)
+    // low (3 sectors) — the only partition reaching the dump
     steps.push(Step::BulkOut(cbw(
         t!(),
         3 * 512,
@@ -608,33 +609,6 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
     )));
     steps.push(Step::BulkIn(low_reply.clone()));
     steps.push(Step::BulkIn(csw(tag)));
-    // straddle (4 sectors: 2 real + 0xCC tail — the unmeasured crossing
-    // READ_LBA assumption)
-    steps.push(Step::BulkOut(cbw(
-        t!(),
-        4 * 512,
-        true,
-        10,
-        opcode::READ_LBA,
-        0,
-        (GUARD - 2) as u32,
-        4,
-    )));
-    steps.push(Step::BulkIn(straddle_reply.clone()));
-    steps.push(Step::BulkIn(csw(tag)));
-    // high (2 sectors of 0xCC)
-    steps.push(Step::BulkOut(cbw(
-        t!(),
-        2 * 512,
-        true,
-        10,
-        opcode::READ_LBA,
-        0,
-        (GUARD + 16) as u32,
-        2,
-    )));
-    steps.push(Step::BulkIn(high_reply.clone()));
-    steps.push(Step::BulkIn(csw(tag)));
 
     let transport = MockTransport::new(steps);
     let mut s = LoaderSession::new(transport, EP_IN, EP_OUT);
@@ -644,40 +618,39 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
     let out = std::env::temp_dir().join(format!("jb-stock-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     let report = backup(&mut s, &test_config(), &out, &progress, true).expect("stock backup");
-    assert_eq!(report.partitions, 3);
+    assert_eq!(report.partitions, 4);
     assert_eq!(report.read_limit_old, None);
 
-    // every partition is dumped full-size with what the device returned
+    // only the partition before boot_a is dumped; boot_a itself (fully
+    // below the read mask!) and the masked ones are skipped whole — no
+    // waste files
     assert_eq!(std::fs::read(out.join("01_low.img")).unwrap(), low_reply);
-    assert_eq!(
-        std::fs::read(out.join("02_straddle.img")).unwrap(),
-        straddle_reply
-    );
-    assert_eq!(std::fs::read(out.join("03_high.img")).unwrap(), high_reply);
+    assert!(!out.join("02_boot_a.img").exists());
+    assert!(!out.join("03_straddle.img").exists());
+    assert!(!out.join("04_high.img").exists());
     // the idblock is below the mask — real content even on the stock
     // loader
     assert_eq!(
         std::fs::read(out.join("idblock.bin")).unwrap(),
         [real(0x40), real(0x41), real(0x42), real(0x43)].concat()
     );
-    // straddle and high are flagged not-intact in the report, low is
-    // not; the caller seals that into a partial v2 manifest
+    // the report names the skipped partitions; what was dumped is
+    // intact (the caller seals that into a partial v2 manifest)
     assert_eq!(
-        report.masked,
-        vec!["straddle".to_string(), "high".to_string()]
+        report.skipped,
+        vec![
+            "boot_a".to_string(),
+            "straddle".to_string(),
+            "high".to_string()
+        ]
     );
-    for (partition, complete) in [("low", true), ("straddle", false), ("high", false)] {
-        let img = report
-            .images
-            .iter()
-            .find(|i| i.partition == partition)
-            .unwrap();
-        assert_eq!(img.complete, complete, "{partition}");
-        assert!(img.size > 0);
-    }
+    assert_eq!(report.images.len(), 1);
+    let img = report.images.iter().find(|i| i.partition == "low").unwrap();
+    assert!(img.complete);
+    assert_eq!(img.size, 3 * 512);
 
-    // straddle and high are flagged, low is not; the run ends with the
-    // NOT-intact warning naming both
+    // each masked skip got its mask step; boot_a got the cut reason;
+    // the run ends with the partial-backup warning naming all three
     let evs = events.into_inner();
     let step_msgs: Vec<&str> = evs
         .iter()
@@ -693,11 +666,17 @@ fn backup_on_stock_loader_keeps_masked_partitions() {
             .count(),
         2
     );
-    assert!(
+    assert_eq!(
         step_msgs
             .iter()
-            .any(|m| m.contains("НЕцелостный") && m.contains("straddle") && m.contains("high"))
+            .filter(|m| m.contains("от boot_a") && m.contains("пропускаю"))
+            .count(),
+        1
     );
+    assert!(step_msgs.iter().any(|m| m.contains("частичный")
+        && m.contains("boot_a")
+        && m.contains("straddle")
+        && m.contains("high")));
 
     let _ = std::fs::remove_dir_all(&out);
 }

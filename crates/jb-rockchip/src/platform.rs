@@ -12,7 +12,7 @@
 //! machine over the current bus state — is retried.
 
 use anyhow::{Context, Result, anyhow, bail};
-use jb_core::backend::Backend;
+use jb_core::backend::{Backend, ConnectError};
 use jb_core::backup_catalog::{self as catalog, BackupManifest};
 use jb_core::backup_store::BackupStore;
 use jb_core::config::Config;
@@ -32,25 +32,43 @@ use std::time::Duration;
 const GADGET_STABLE: Duration = Duration::from_secs(10);
 
 /// The live device as the flow sees it (after connect). The `firstgen`
-/// flag selects the path inside the shared flow: first generation and
-/// --no-backup runs work over the stock loader (330d); on first
-/// generation the backup is NOT intact (0xCC above the 32 MiB read
-/// mask) and userdata is always built from scratch. `usbplug` tracks
-/// which persona the session is: connect stays on the stock loader
-/// (identity is all it needs), the dump switches a regular column to
-/// our usbplug on demand.
+/// flag selects the degraded path inside the shared flow: the first
+/// generation (gift serial) and columns whose BootROM refuses our
+/// loader (some 0100 batches) — the session is the stock loader (330d),
+/// the dump only covers the partitions fully below the 32 MiB read
+/// mask and userdata is always built from scratch. `usbplug` tracks
+/// which persona the session is: a regular column connects over our
+/// usbplug (loaded at connect), the degraded path stays on the stock
+/// loader.
 struct Device {
     session: rockusb::LoaderSession<NusbTransport>,
     serial: String,
-    /// First generation: the stock u-boot rockusb loader (330d) with a
-    /// gift serial — the dump above the 32 MiB read mask is 0xCC,
-    /// userdata is built from scratch.
+    /// The degraded path (stock loader, partial dump, userdata from
+    /// scratch): the first generation OR an incompatible-batch column
+    /// the user chose to continue with.
     firstgen: bool,
     /// The session is our usbplug in RAM (readable above the stock
     /// mask) — as opposed to the stock loader persona.
     usbplug: bool,
     /// A fresh backup was taken this run.
     dumped: bool,
+}
+
+/// How the next connect must run. `Fresh` is the default: the loader
+/// persona is reset into MaskROM and our usbplug is loaded into RAM.
+/// `StockOnly` is the accepted degraded flow (the user pressed
+/// "continue"): ONLY the stock loader persona (330d) is accepted (see
+/// [`Rockchip::present`]), nothing is ever downloaded into RAM again —
+/// restarting the tool resets to `Fresh`.
+#[derive(Default)]
+enum Prep {
+    #[default]
+    Fresh,
+    StockOnly {
+        /// The column the user consented for; a different serial on
+        /// re-entry restarts the fresh flow for the new column.
+        serial: String,
+    },
 }
 
 /// The rockchip platform. Holds the Windows driver session alive for
@@ -62,6 +80,7 @@ pub struct Rockchip {
     device: Option<Device>,
     gpt: Option<crate::gpt::Gpt>,
     wait: Option<Duration>,
+    prep: Prep,
 }
 
 impl Rockchip {
@@ -72,6 +91,7 @@ impl Rockchip {
             device: None,
             gpt: None,
             wait: None,
+            prep: Prep::Fresh,
         }
     }
 }
@@ -89,7 +109,14 @@ impl Backend for Rockchip {
 
     fn present(&self) -> Result<bool> {
         match rockusb::current_mode() {
-            Ok(m) => Ok(m.is_some()),
+            // In the accepted degraded flow only the stock loader
+            // persona may proceed: after a refused loader the board
+            // sits in MaskROM, and re-connecting to that would loop
+            // the same failure forever.
+            Ok(m) => Ok(match (&self.prep, m) {
+                (Prep::StockOnly { .. }, mode) => mode == Some(rockusb::DeviceMode::Loader),
+                (_, mode) => mode.is_some(),
+            }),
             // a transient enumeration failure (a devnode mid-rebind on
             // Windows) must not abort the wait — report "not present"
             Err(e) => {
@@ -103,26 +130,48 @@ impl Backend for Rockchip {
         Some(self.config.connect_text(Model::Capsula))
     }
 
-    fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
+    fn connect(
+        &mut self,
+        wait: Option<Duration>,
+        progress: ProgressFn,
+    ) -> Result<Identity, ConnectError> {
         self.wait = wait;
         self.gpt = None;
         let dev = self.connect_device(wait, progress)?;
+        let firstgen = crate::firstgen::is_first_generation(&dev.serial);
         if dev.firstgen {
             log::info!(
-                "первое поколение {} (стоковый лоадер): бэкап нецелостный \
-                 (маска 0xCC выше 32 МиБ), userdata будет собран с нуля",
+                "{} {} (стоковый лоадер): полный бэкап невозможен — \
+                 маска 0xCC выше 32 МиБ; userdata будет собран с нуля",
+                if firstgen {
+                    "первое поколение"
+                } else {
+                    "несовместимый BootROM"
+                },
                 dev.serial
             );
         }
         let identity = Identity {
             model: Model::Capsula,
             key: dev.serial.clone(),
-            firstgen: dev.firstgen,
+            // The true first-generation flag (the serial rule); an
+            // incompatible-batch column is NOT the first generation —
+            // its reason lives in the caveats.
+            firstgen,
             caveats: if dev.firstgen {
-                vec![
-                    "полный бэкап невозможен (BootROM залочен): дамп нецелостный, 0xCC выше 32 МиБ"
-                        .into(),
-                ]
+                if firstgen {
+                    vec![
+                        "полный бэкап невозможен (BootROM залочен): дамп \
+                         только разделов до boot_a, userdata с нуля"
+                            .into(),
+                    ]
+                } else {
+                    vec![
+                        "полный бэкап невозможен: лоадер несовместим с этой \
+                         колонкой — дамп только разделов до boot_a, userdata с нуля"
+                            .into(),
+                    ]
+                }
             } else {
                 vec![]
             },
@@ -246,9 +295,9 @@ impl Platform for Rockchip {
     fn describe_write(&self, fresh: bool, no_backup: bool) -> String {
         let firstgen = self.device.as_ref().map(|d| d.firstgen).unwrap_or(false);
         if firstgen {
-            "оверлей adbd на чистый ext2 — бэкап первого поколения нецелостный \
-             (0xCC выше 32 МиБ), userdata собирается с нуля, содержимое \
-             теряется"
+            "оверлей adbd на чистый ext2 — полный бэкап невозможен \
+             (первое поколение/несовместимый BootROM), userdata \
+             собирается с нуля, содержимое теряется"
                 .into()
         } else if no_backup {
             "оверлей adbd на чистый ext2 (--no-backup: бэкап не снимался, \
@@ -397,8 +446,9 @@ impl Platform for Rockchip {
     fn report_backup(&self, prepared: &Prepared) {
         if !prepared.complete {
             log::info!(
-                "первое поколение: полный дамп невозможен (BootROM залочен) — \
-                 читаемы только разделы ниже 32 МиБ, дамп НЕцелостный"
+                "частичный бэкап: наш лоадер на этой колонке не запускается — \
+                 сняты только разделы до boot_a (от boot_a и выше \
+                 стоковый лоадер читает 0xCC), userdata собирается с нуля"
             );
         }
         let serial = self
@@ -431,10 +481,42 @@ fn backup_dir(serial: &str) -> PathBuf {
         .join(BackupStore::dir_name(serial))
 }
 
+/// The degraded-flow notice: the loader our usbplug needs does not run
+/// on this column (the first generation, or an incompatible batch),
+/// so the full backup is impossible and the user must consent. After
+/// "continue" only the stock loader persona (330d) is accepted.
+/// `by_serial`: the gift serial said it up front — the board was NOT
+/// reset and already sits in the loader mode, so no re-entry needed;
+/// otherwise the MaskROM reset left it stranded and the user must
+/// power-cycle it back into the loader mode.
+fn degraded_notice(by_serial: bool) -> Vec<String> {
+    let mut notice = vec![
+        if by_serial {
+            "Кажется, у вас колонка первого поколения.".into()
+        } else {
+            "Кажется, у вас колонка первого поколения — или партии, на которой наш лоадер не запускается.".into()
+        },
+        "Полный бэкап на ней невозможен: выше 32 МиБ стоковый лоадер читает только мусор 0xCC.".into(),
+        "Продолжить можно без полного бэкапа: снимутся только разделы до boot_a, userdata будет собран с нуля.".into(),
+    ];
+    notice.push(if by_serial {
+        "Колонка уже в режиме лоадера — просто нажмите «Продолжить».".into()
+    } else {
+        "Выключите колонку, зажмите Recovery и включите — войдёт в режим лоадера, — затем нажмите «Продолжить».".into()
+    });
+    notice
+}
+
 impl Rockchip {
-    /// Connect with the driver-rebind retries: bring-up staying on the
-    /// stock loader (identity only — no dump, no MaskROM round-trip).
-    fn connect_device(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Device> {
+    /// Connect with the driver-rebind retries: the fresh flow loads our
+    /// usbplug into RAM, the accepted degraded flow attaches the stock
+    /// loader. An Attention (the degraded-flow consent) is NOT retried —
+    /// it is for the user to settle, not a driver problem.
+    fn connect_device(
+        &mut self,
+        wait: Option<Duration>,
+        progress: ProgressFn,
+    ) -> Result<Device, ConnectError> {
         if win_drv::any_rockchip_node_misbound() {
             log::info!("устройство Rockchip без WinUSB — ставлю драйвер");
             self.start_or_wait_drivers(Duration::from_secs(180));
@@ -444,7 +526,8 @@ impl Rockchip {
         for attempt in 1..=ATTEMPTS {
             match self.connect_once(wait, progress) {
                 Ok(s) => return Ok(s),
-                Err(e) => {
+                attention @ Err(ConnectError::Attention { .. }) => return attention,
+                Err(ConnectError::Fatal(e)) => {
                     let binding_error = win_drv::chain_is_binding_error(&e);
                     if binding_error && attempt < ATTEMPTS {
                         log::warn!(
@@ -455,50 +538,89 @@ impl Rockchip {
                     }
                     if binding_error {
                         // the driver supervisor could not win in ATTEMPTS tries
-                        return Err(e.context(format!(
+                        return Err(ConnectError::Fatal(e.context(format!(
                             "драйвер WinUSB не установился; лог: {}\n\
                              ручной путь: DRIVER-SETUP.txt (Zadig)",
                             self.drivers.log_path().display()
-                        )));
+                        ))));
                     }
-                    return Err(e);
+                    return Err(ConnectError::Fatal(e));
                 }
             }
         }
-        bail!("перебор попыток перевязки драйвера")
+        Err(ConnectError::Fatal(anyhow!(
+            "перебор попыток перевязки драйвера"
+        )))
     }
 
-    /// One connect attempt (no retries). The first-generation
-    /// classification lives in bring_up (session.rs): the returned
-    /// `firstgen` flag drives everything downstream.
-    fn connect_once(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Device> {
+    /// One connect attempt (no retries). Fresh: bring the column up on
+    /// our usbplug (MaskROM round-trip, RAM download); a column that
+    /// cannot run it — the first generation by its serial, or a batch
+    /// whose BootROM refuses the loader — becomes the degraded-flow
+    /// Attention for the user. StockOnly (after "continue"): attach the
+    /// stock loader, refusing a different column (that one gets the
+    /// fresh flow for itself).
+    fn connect_once(
+        &mut self,
+        wait: Option<Duration>,
+        progress: ProgressFn,
+    ) -> Result<Device, ConnectError> {
         let loader = crate::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
         let mut bus = crate::session::UsbBus;
-        let up = match crate::session::bring_up(
-            &mut bus,
-            &self.config,
-            &loader,
-            wait,
-            crate::session::Goal::StockLoader,
-            progress,
-        ) {
-            Ok(v) => v,
-            Err(crate::session::BringUpError::LoaderRejected) => bail!(
-                "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
-                 плата или первое поколение в MaskROM — отпустите Recovery и \
-                 войдите в режим лоадера заново)"
-            ),
-            Err(e) => return Err(e.into()),
-        };
-
-        log::info!("серийник колонки: {}", up.serial);
-        Ok(Device {
-            session: up.session,
-            serial: up.serial,
-            firstgen: up.firstgen,
-            usbplug: false,
-            dumped: false,
-        })
+        loop {
+            let degraded = matches!(self.prep, Prep::StockOnly { .. });
+            let goal = if degraded {
+                crate::session::Goal::StockLoader
+            } else {
+                crate::session::Goal::UsbPlug
+            };
+            let up =
+                crate::session::bring_up(&mut bus, &self.config, &loader, wait, goal, progress)
+                    .map_err(|e| match e {
+                        crate::session::BringUpError::FirstGeneration { serial } => {
+                            // The user decides; on "continue" ONLY this column's
+                            // stock loader (330d re-entry) is accepted.
+                            let by_serial = crate::firstgen::is_first_generation(&serial);
+                            log::warn!(
+                                "полный бэкап невозможен: колонка {serial} не запускает \
+                         наш лоадер (первое поколение или несовместимая партия)"
+                            );
+                            self.prep = Prep::StockOnly { serial };
+                            ConnectError::Attention {
+                                notice: degraded_notice(by_serial),
+                            }
+                        }
+                        crate::session::BringUpError::LoaderRejected => {
+                            ConnectError::Fatal(anyhow!(
+                                "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
+                     плата — отпустите Recovery и войдите в режим лоадера заново)"
+                            ))
+                        }
+                        e => ConnectError::Fatal(anyhow!(e)),
+                    })?;
+            if let Prep::StockOnly { serial } = &self.prep
+                && &up.serial != serial
+            {
+                // a different column showed up in the loader persona:
+                // the consent was for another one — run the fresh flow
+                // for this column from scratch
+                log::warn!(
+                    "на шине другая колонка ({}, ждал {}): начинаю полный флоу заново",
+                    up.serial,
+                    serial
+                );
+                self.prep = Prep::Fresh;
+                continue;
+            }
+            log::info!("серийник колонки: {}", up.serial);
+            return Ok(Device {
+                session: up.session,
+                serial: up.serial,
+                firstgen: degraded || up.firstgen,
+                usbplug: !degraded,
+                dumped: false,
+            });
+        }
     }
 
     /// Dump with the driver-rebind retries (the old dump_all skeleton:
@@ -592,7 +714,7 @@ impl Rockchip {
                 });
             }
         }
-        let masked = &report.masked;
+        let skipped = &report.skipped;
         let manifest = BackupManifest {
             format: catalog::FORMAT,
             model: Model::Capsula,
@@ -602,18 +724,20 @@ impl Rockchip {
                 .unwrap_or_default(),
             created_utc: jb_core::format::utc_now_iso(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            status: if masked.is_empty() {
+            status: if skipped.is_empty() {
                 catalog::Status::Complete
             } else {
                 catalog::Status::Partial
             },
-            notes: if masked.is_empty() {
+            notes: if skipped.is_empty() {
                 vec![]
             } else {
                 vec![format!(
-                    "первое поколение: дамп нецелостный — выше 32 МиБ \
-                     стоковый лоадер отдаёт 0xCC ({})",
-                    masked.join(", ")
+                    "частичный дамп: наш лоадер не запускается на этой \
+                     колонке (первое поколение или несовместимая партия) — \
+                     сняты только разделы до boot_a (от boot_a и выше \
+                     стоковый лоадер читает 0xCC), не снимались: {}",
+                    skipped.join(", ")
                 )]
             },
             images: report.images.clone(),

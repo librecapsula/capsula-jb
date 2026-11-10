@@ -1,15 +1,20 @@
 //! Device bring-up and pipeline primitives shared by the operations.
 //!
-//! Every regular-column operation that reads the flash above the stock
-//! 32 MiB read mask (the full dump) runs over OUR usbplug loaded into
-//! RAM from the OTA loader: the RAM-patch address is only known for
-//! this build, so the DRAM signatures are always verified.
+//! The production connect (`platform::connect_once`) runs bring-up with
+//! [`Goal::UsbPlug`]: the loader persona (330d) identifies the column,
+//! then it is reset into MaskROM and OUR usbplug is loaded into RAM
+//! from the OTA loader (the RAM-patch address is only known for this
+//! build, so the DRAM signatures are always verified). A column that
+//! cannot run it — the first generation by its serial, or a batch with
+//! an incompatible BootROM (the maskrom→loader hand-off fails on some
+//! 0100 units) — comes back as [`BringUpError::FirstGeneration`]: the
+//! caller asks the user and re-connects with [`Goal::StockLoader`]
+//! over the stock u-boot rockusb loader (330d) alone.
 //!
-//! When nothing above the mask is read, the stock u-boot rockusb loader
-//! (330d) is enough (GPT lives at LBA 1, userdata goes through the
-//! stock WRITE_LBA), so bring-up keeps it: first-generation columns
-//! (their locked BootROM rejects our loader anyway) and `--no-backup`
-//! runs. The caller then runs the no-backup userdata flow.
+//! The stock loader is enough whenever nothing above the 32 MiB read
+//! mask is touched (GPT lives at LBA 1, userdata goes through the
+//! stock WRITE_LBA): the degraded flow and `--no-backup` runs keep it
+//! and never download anything into RAM.
 
 use crate::firstgen::is_first_generation;
 use jb_core::config::Config;
@@ -22,21 +27,28 @@ use std::time::{Duration, Instant};
 
 /// Bring-up error. `LoaderRejected`: the usbplug did not start — BootROM
 /// silently rejected the loader signature (an unsupported board).
+/// `FirstGeneration`: under [`Goal::UsbPlug`] the column cannot run our
+/// loader — either the first generation (the serial says so up front) or
+/// a batch with an incompatible BootROM (the maskrom→loader hand-off
+/// fails on some 0100 units); the only way on is the stock loader, so
+/// the caller must ask the user and wait for a 330d re-entry.
 #[derive(Debug, thiserror::Error)]
 pub enum BringUpError {
     #[error(transparent)]
     Usb(#[from] rockusb::Error),
     #[error("usbplug не запустился: BootROM отклонил лоадер")]
     LoaderRejected,
+    #[error("первое поколение/несовместимый BootROM ({serial}): полный бэкап невозможен")]
+    FirstGeneration { serial: String },
 }
 
-/// The live device session after bring-up. `firstgen`: first
-/// generation — the persona is the stock u-boot rockusb loader (330d
-/// with a gift serial); a full backup is impossible on that hardware,
-/// userdata is written through the stock WRITE_LBA. For `--no-backup`
-/// runs the session is the stock loader too (regular columns included):
-/// nothing above the stock read mask is ever read, so our usbplug is
-/// not downloaded.
+/// The live device session after bring-up. `firstgen` can only be
+/// true under [`Goal::StockLoader`]: the session is the stock u-boot
+/// rockusb loader (330d) — either a genuine first-generation column
+/// (gift serial) or a degraded re-connect the user consented to after
+/// our loader was refused. The full backup is impossible on that path
+/// (the 32 MiB read mask); userdata is written through the stock
+/// WRITE_LBA.
 pub struct BroughtUp<T: Transport> {
     pub session: LoaderSession<T>,
     /// The column identity serial for the backup key. Read exactly once
@@ -147,18 +159,23 @@ fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: Progress
 }
 
 /// What the caller needs from bring-up. The session persona follows
-/// the goal; the first generation always ends on the stock loader (its
-/// locked BootROM rejects our usbplug).
+/// the goal. The first generation never runs our usbplug (its locked
+/// BootROM rejects it) — with [`Goal::UsbPlug`] that is an error for
+/// the caller to settle with the user, with [`Goal::StockLoader`] the
+/// stock loader is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Goal {
     /// Identity + the below-mask range (GPT at LBA 1, stock WRITE_LBA):
-    /// the stock loader (330d) is enough — connect and --no-backup
-    /// runs. No MaskROM round-trip, no RAM download.
+    /// the stock loader (330d) is enough — the degraded (first
+    /// generation / incompatible-batch) re-connect and --no-backup
+    /// runs. No MaskROM round-trip, no RAM download; a first-generation
+    /// serial returns `firstgen = true` on the stock-loader session.
     StockLoader,
     /// A session that can read above the stock 32 MiB read mask (the
-    /// full dump): our usbplug loaded into RAM. First generation
-    /// cannot and stays on the stock loader (`firstgen = true` tells
-    /// the caller).
+    /// full dump): our usbplug loaded into RAM. Never degrades on its
+    /// own: a first-generation serial or a loader the BootROM refuses
+    /// is [`BringUpError::FirstGeneration`] — the caller asks the user
+    /// and re-connects with [`Goal::StockLoader`].
     UsbPlug,
 }
 
@@ -172,13 +189,15 @@ pub enum Goal {
 /// MaskROM entry, a broken serial read) is refused with a re-entry
 /// instruction, and only the loader persona is accepted afterwards.
 ///
-/// - Loader (330d) with a first-generation serial: the stock loader
-///   itself — `firstgen = true` (our loader would be rejected by its
-///   locked BootROM);
+/// - Loader (330d) with a first-generation serial: [`Goal::StockLoader`]
+///   keeps the stock loader — `firstgen = true`; [`Goal::UsbPlug`]
+///   returns [`BringUpError::FirstGeneration`] without touching the
+///   board (its locked BootROM rejects our loader anyway);
 /// - Loader (330d) with a regular serial: [`Goal::StockLoader`] keeps
 ///   the stock loader; [`Goal::UsbPlug`] resets into MaskROM and loads
-///   our loader (the RAM-patch constants do not apply to the stock
-///   u-boot usbplug);
+///   our loader — if it does not start (an incompatible-batch BootROM),
+///   [`BringUpError::FirstGeneration`] names the column for the caller
+///   to settle with the user;
 /// - raw MaskROM (330e) with the serial already captured: download the
 ///   loader into RAM (flash untouched);
 /// - empty bus / Linux gadget: print the hint and wait for a download mode.
@@ -235,6 +254,14 @@ pub fn bring_up<B: Bus>(
                 }
                 let serial = serial.clone().unwrap();
                 let firstgen = is_first_generation(&serial);
+                // Under Goal::UsbPlug the first generation is the
+                // caller's decision, not ours: its locked BootROM
+                // rejects our loader, so ask (the caller shows the
+                // notice) instead of silently degrading. The board is
+                // NOT reset — it stays on the loader persona.
+                if firstgen && goal == Goal::UsbPlug {
+                    return Err(BringUpError::FirstGeneration { serial });
+                }
                 // Both stay on the stock loader: first generation
                 // cannot run our usbplug at all, and a stock-loader
                 // goal never reads above the stock read mask.
@@ -251,7 +278,13 @@ pub fn bring_up<B: Bus>(
                         firstgen,
                     });
                 }
-                let session = load_usbplug(bus, config, loader, progress)?;
+                // The board reached MaskROM, so the pipe is fine: a
+                // loader that does not start there is an incompatible
+                // BootROM (some 0100 batches) — the same first-
+                // generation settlement, the column named for the
+                // caller.
+                let session = load_usbplug(bus, config, loader, progress)
+                    .map_err(|e| first_generation_or(e, serial.clone()))?;
                 return Ok(BroughtUp {
                     session,
                     serial,
@@ -267,7 +300,8 @@ pub fn bring_up<B: Bus>(
                     std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
                     continue;
                 };
-                let session = download_usbplug(bus, config, loader, progress)?;
+                let session = download_usbplug(bus, config, loader, progress)
+                    .map_err(|e| first_generation_or(e, ident.clone()))?;
                 return Ok(BroughtUp {
                     session,
                     serial: ident,
@@ -383,9 +417,29 @@ fn load_usbplug<B: Bus>(
     download_usbplug(bus, config, loader, progress)
 }
 
+/// How long the downloaded loader has to come up as the usbplug
+/// persona. On compatible hardware it enumerates within a couple of
+/// seconds; the locked first-generation BootROM silently drops the
+/// loader and the persona never appears — the maskrom entry itself
+/// proves the pipe is fine, so this deadline separates "incompatible
+/// BootROM" from a cable problem.
+const USBPLUG_WAIT: Duration = Duration::from_secs(10);
+
+/// A `bring_up` loader-start failure becomes [`BringUpError::
+/// FirstGeneration`] naming the column; anything else (a dead 330d
+/// session, a wrong mode) stays as-is for the caller to report.
+fn first_generation_or(e: BringUpError, serial: String) -> BringUpError {
+    match e {
+        BringUpError::LoaderRejected => BringUpError::FirstGeneration { serial },
+        other => other,
+    }
+}
+
 /// The board is in MaskROM: download our loader into RAM (flash
 /// untouched), wait for the usbplug persona and open a verified
-/// session.
+/// session. A download rejected over the wire (a USB transfer reset —
+/// the locked BootROM throws the loader out) is the same "did not
+/// start" as the persona never appearing.
 fn download_usbplug<B: Bus>(
     bus: &mut B,
     config: &Config,
@@ -397,11 +451,14 @@ fn download_usbplug<B: Bus>(
     ));
     {
         let mut m = MaskRomSession::new(bus.open_maskrom()?);
-        m.download(loader)?;
+        m.download(loader).map_err(|_| {
+            progress(Progress::Step("лоадер отвергнут на передаче".into()));
+            BringUpError::LoaderRejected
+        })?;
     }
-    progress(Progress::Step("жду usbplug (до 20 с)".into()));
+    progress(Progress::Step("жду usbplug (до 10 с)".into()));
     if bus
-        .wait_mode(rockusb::DeviceMode::UsbPlug, Duration::from_secs(20))
+        .wait_mode(rockusb::DeviceMode::UsbPlug, USBPLUG_WAIT)
         .is_err()
     {
         progress(Progress::Step("usbplug не поднялся".into()));

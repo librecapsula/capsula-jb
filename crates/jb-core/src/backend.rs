@@ -10,6 +10,24 @@ use crate::session::Identity;
 use anyhow::Result;
 use std::time::Duration;
 
+/// The typed failure of a [`Backend::connect`]. [`ConnectError::Attention`]
+/// is not an error: the platform needs the user's explicit consent for a
+/// degraded flow (rockchip: the full backup is impossible — the first
+/// generation, or a batch whose BootROM refuses our loader) and a device
+/// re-entry. The worker shows the notice, waits for the device to appear
+/// again and retries connect; the backend itself narrows what it accepts
+/// after the attention.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    /// Show the notice, ask the user to continue; on `Proceed` wait for
+    /// the device again and call connect once more.
+    #[error("connect: требуется подтверждение пользователя")]
+    Attention { notice: Vec<String> },
+    /// Anything else kills the run as before.
+    #[error(transparent)]
+    Fatal(#[from] anyhow::Error),
+}
+
 /// One supported speaker platform. `Send` because the session worker
 /// owns the backends on its own thread.
 pub trait Backend: Send {
@@ -30,8 +48,16 @@ pub trait Backend: Send {
     /// Bring the device into a working session and identify it: the
     /// column model, the backup key (serial / deviceid), the first-gen
     /// flag. Identity-only — no dump, no writes; the backup is settled
-    /// later by [`crate::scenario::Platform::ensure_backup`].
-    fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity>;
+    /// later by [`crate::scenario::Platform::ensure_backup`]. May take
+    /// long (driver installs, a loader download into RAM); the worker
+    /// announces it with [`crate::session::Event::Connecting`]. A
+    /// [`ConnectError::Attention`] return asks the user to accept a
+    /// degraded flow and re-enter the device.
+    fn connect(
+        &mut self,
+        wait: Option<Duration>,
+        progress: ProgressFn,
+    ) -> Result<Identity, ConnectError>;
 
     /// The connected device's [`crate::scenario::Platform`] hooks —
     /// the scenario skeleton runs over them.

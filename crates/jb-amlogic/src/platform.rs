@@ -20,7 +20,7 @@ use crate::env;
 use crate::write::{WriteState, write_data_pass};
 use amlogic::{AmlogicSession, NusbTransport};
 use anyhow::{Context, Result, anyhow, bail};
-use jb_core::backend::Backend;
+use jb_core::backend::{Backend, ConnectError};
 use jb_core::config::Config;
 use jb_core::format::humansize;
 use jb_core::model::Model;
@@ -186,7 +186,11 @@ impl Backend for Amlogic {
         Some(self.config.connect_text(Model::CapsulaMiniAmlogic))
     }
 
-    fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
+    fn connect(
+        &mut self,
+        wait: Option<Duration>,
+        progress: ProgressFn,
+    ) -> Result<Identity, ConnectError> {
         self.wait = wait;
         self.capture = None;
         self.env_raw = None;

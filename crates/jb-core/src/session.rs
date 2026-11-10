@@ -9,7 +9,7 @@
 //! blocks the worker until the UI answers (or its end of the channel
 //! closes — that aborts).
 
-use crate::backend::Backend;
+use crate::backend::{Backend, ConnectError};
 use crate::model::Model;
 use crate::progress::Progress;
 use crate::scenario::{self, BackupState, Params, WritePlan};
@@ -58,6 +58,11 @@ pub enum Event {
     WaitingForDevice {
         hints: Vec<String>,
     },
+    /// A device showed up on the bus and the bring-up started (it may
+    /// load a loader into RAM, install drivers — potentially tens of
+    /// seconds). Ends with [`Event::DeviceConnected`], an attention or
+    /// [`Event::Finished`].
+    Connecting,
     /// A device connected and identified.
     DeviceConnected {
         identity: Identity,
@@ -70,6 +75,15 @@ pub enum Event {
     /// is BLOCKED until `reply` answers; dropping the sender aborts.
     ConfirmRequested {
         plan: WritePlan,
+        reply: Sender<Decision>,
+    },
+    /// The connect hit a degraded flow the user must accept (rockchip:
+    /// the full backup is impossible). The worker is BLOCKED until
+    /// `reply` answers; on `Proceed` it waits for the device again (the
+    /// backend narrows what it accepts) and re-connects. Dropping the
+    /// sender aborts.
+    AttentionRequested {
+        notice: Vec<String>,
         reply: Sender<Decision>,
     },
     /// The operation ended (Ok = the scenario completed). The worker
@@ -159,7 +173,10 @@ fn worker(
 }
 
 /// Poll every backend's presence, connect the first one that shows up.
-/// Emits [`Event::WaitingForDevice`] once while the bus is empty.
+/// Emits [`Event::WaitingForDevice`] once while the bus is empty. A
+/// connect that returns [`ConnectError::Attention`] asks the user; on
+/// `Proceed` the loop continues waiting (the backend itself narrows
+/// `present()` to what it accepts) and connect runs again.
 fn wait_for_backend(
     mut backends: Vec<Box<dyn Backend>>,
     wait: Option<Duration>,
@@ -181,14 +198,31 @@ fn wait_for_backend(
             let progress = |ev: Progress| {
                 let _ = events.send(Event::Progress(ev));
             };
-            let identity = b.connect(wait, &progress)?;
-            let _ = events.send(Event::DeviceConnected {
-                identity: identity.clone(),
-            });
-            let _ = events.send(Event::BackupState(b.platform().backup_state()));
-            return Ok(b);
-        }
-        if !hint_shown {
+            let _ = events.send(Event::Connecting);
+            match b.connect(wait, &progress) {
+                Ok(identity) => {
+                    let _ = events.send(Event::DeviceConnected {
+                        identity: identity.clone(),
+                    });
+                    let _ = events.send(Event::BackupState(b.platform().backup_state()));
+                    return Ok(b);
+                }
+                Err(ConnectError::Attention { notice }) => {
+                    let (reply, answer) = channel::<Decision>();
+                    if events
+                        .send(Event::AttentionRequested { notice, reply })
+                        .is_err()
+                    {
+                        bail!("прервано пользователем");
+                    }
+                    match answer.recv() {
+                        Ok(Decision::Proceed) => backends.push(b),
+                        Ok(Decision::Abort) | Err(_) => bail!("прервано пользователем"),
+                    }
+                }
+                Err(ConnectError::Fatal(e)) => return Err(e),
+            }
+        } else if !hint_shown {
             let hints = backends
                 .iter()
                 .filter_map(|b| b.wait_hint().map(str::to_owned))
@@ -209,15 +243,19 @@ fn wait_for_backend(
 mod tests {
     use super::*;
     use crate::scenario::Prepared;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
 
     /// A scriptable backend: presence is a counter (0 = absent), the
-    /// platform records hook calls and echoes a canned identity.
+    /// platform records hook calls and echoes a canned identity. The
+    /// first `attentions` connects return an Attention (a degraded-flow
+    /// consent) before the identity succeeds.
     struct FakeBackend {
         present_after: u32,
         polls: RefCell<u32>,
         calls: RefCell<Vec<&'static str>>,
+        attentions: u32,
+        connect_attempts: Cell<u32>,
         identity: Identity,
         base: Option<PathBuf>,
     }
@@ -228,6 +266,8 @@ mod tests {
                 present_after: 1,
                 polls: RefCell::new(0),
                 calls: RefCell::new(vec![]),
+                attentions: 0,
+                connect_attempts: Cell::new(0),
                 identity: Identity {
                     model: Model::Capsula,
                     key: "TESTSERIAL".into(),
@@ -236,6 +276,12 @@ mod tests {
                 },
                 base: None,
             }
+        }
+
+        fn with_attentions(attentions: u32) -> Self {
+            let mut b = Self::online();
+            b.attentions = attentions;
+            b
         }
     }
 
@@ -331,8 +377,15 @@ mod tests {
             &mut self,
             _wait: Option<Duration>,
             _progress: crate::progress::ProgressFn,
-        ) -> Result<Identity> {
+        ) -> Result<Identity, ConnectError> {
             self.calls.borrow_mut().push("connect");
+            let attempt = self.connect_attempts.get();
+            self.connect_attempts.set(attempt + 1);
+            if attempt < self.attentions {
+                return Err(ConnectError::Attention {
+                    notice: vec!["degraded".into()],
+                });
+            }
             Ok(self.identity.clone())
         }
 
@@ -348,9 +401,11 @@ mod tests {
 
         let mut saw_identity = false;
         let mut saw_backup_state = false;
+        let mut saw_connecting = false;
         loop {
             match session.events().recv().unwrap() {
                 Event::WaitingForDevice { .. } => {}
+                Event::Connecting => saw_connecting = true,
                 Event::DeviceConnected { identity } => {
                     assert_eq!(identity.key, "TESTSERIAL");
                     saw_identity = true;
@@ -365,9 +420,58 @@ mod tests {
                     break;
                 }
                 Event::Progress(_) => {}
+                Event::AttentionRequested { .. } => unreachable!("без attention"),
             }
         }
-        assert!(saw_identity && saw_backup_state);
+        assert!(saw_identity && saw_backup_state && saw_connecting);
+    }
+
+    #[test]
+    fn attention_round_trip_reconnects() {
+        // First connect asks for a degraded-flow consent; after Proceed
+        // the worker waits for the device again and connects.
+        let session = Session::spawn(vec![Box::new(FakeBackend::with_attentions(1))], None);
+        let mut identity = false;
+        loop {
+            match session.events().recv().unwrap() {
+                Event::AttentionRequested { notice, reply } => {
+                    assert_eq!(notice, vec!["degraded".to_string()]);
+                    reply.send(Decision::Proceed).unwrap();
+                }
+                Event::DeviceConnected { identity: id } => {
+                    assert_eq!(id.key, "TESTSERIAL");
+                    identity = true;
+                    // finish the run: without a command the worker just
+                    // serves events forever
+                    session.command(Command::Backup);
+                }
+                Event::Finished(r) => {
+                    r.unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(identity, "после Proceed колонка должна подключиться");
+    }
+
+    #[test]
+    fn attention_abort_ends_the_worker() {
+        let session = Session::spawn(vec![Box::new(FakeBackend::with_attentions(u32::MAX))], None);
+        loop {
+            match session.events().recv().unwrap() {
+                Event::AttentionRequested { reply, .. } => {
+                    let _ = reply.send(Decision::Abort);
+                }
+                Event::Finished(r) => {
+                    assert_eq!(r.unwrap_err().to_string(), "прервано пользователем");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // the worker is gone: the channel closes
+        assert!(session.events().recv().is_err());
     }
 
     #[test]
@@ -406,7 +510,7 @@ mod tests {
                 &mut self,
                 _wait: Option<Duration>,
                 _progress: crate::progress::ProgressFn,
-            ) -> Result<Identity> {
+            ) -> Result<Identity, ConnectError> {
                 unreachable!()
             }
             fn platform(&mut self) -> &mut dyn crate::scenario::Platform {

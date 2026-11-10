@@ -3,8 +3,8 @@
 //! verified.
 
 use super::render;
-use crate::app::{App, Busy, Focus, Screen};
-use jb_core::backend::Backend;
+use crate::app::{App, Busy, Confirm, Focus, Screen};
+use jb_core::backend::{Backend, ConnectError};
 use jb_core::model::Model;
 use jb_core::session::Identity;
 
@@ -23,7 +23,7 @@ impl jb_core::backend::Backend for NoBackend {
         &mut self,
         _w: Option<std::time::Duration>,
         _p: jb_core::progress::ProgressFn,
-    ) -> anyhow::Result<jb_core::session::Identity> {
+    ) -> Result<jb_core::session::Identity, ConnectError> {
         unreachable!()
     }
     fn platform(&mut self) -> &mut dyn jb_core::scenario::Platform {
@@ -95,4 +95,38 @@ fn wheel_over_log_scrolls() {
     assert_eq!(a.log_scroll, 1);
     a.on_mouse(mk(ratatui::crossterm::event::MouseEventKind::ScrollDown));
     assert_eq!(a.log_scroll, 0);
+}
+
+/// The preparing screen is control-less: it renders (the log pane
+/// included) and registers no hit rects — nothing to click while the
+/// worker brings the device up.
+#[test]
+fn preparing_screen_renders_without_controls() {
+    let mut a = app();
+    a.activate(Focus::Model(0));
+    a.screen = Screen::Preparing;
+    a.push_log("лоадер (330d): сбрасываю в MaskROM");
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut a)).unwrap();
+    assert!(a.hit.is_empty());
+}
+
+/// The first-gen modal is Continue-only: the OK button covers the
+/// whole button row and no cancel button is registered.
+#[test]
+fn firstgen_modal_is_continue_only() {
+    let mut a = app();
+    a.activate(Focus::Model(0));
+    a.screen = Screen::Waiting;
+    a.confirm = Some(Confirm::Firstgen {
+        notice: vec!["кажется, первое поколение".into()],
+        reply: None,
+    });
+    a.focus = Focus::ModalOk;
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut a)).unwrap();
+    assert!(a.hit.contains_key(&Focus::ModalOk));
+    assert!(!a.hit.contains_key(&Focus::ModalCancel));
 }

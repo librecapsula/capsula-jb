@@ -1,7 +1,7 @@
 //! State-machine tests over a fake backend — no terminal, no hardware.
 
 use super::*;
-use jb_core::backend::Backend;
+use jb_core::backend::{Backend, ConnectError};
 use jb_core::model::Model;
 use jb_core::progress::Progress;
 use jb_core::scenario::Prepared;
@@ -11,8 +11,12 @@ use std::time::Duration;
 
 /// The same fake as jb-core's session tests, reused through a
 /// fresh Session per case (the worker serves one op at a time).
+/// `attentions`: how many first connects return the degraded-flow
+/// Attention before the identity succeeds (the rockchip first-gen
+/// settlement).
 struct FakeBackend {
     identity: Identity,
+    attentions: std::cell::Cell<u32>,
 }
 
 impl jb_core::scenario::Platform for FakeBackend {
@@ -89,7 +93,13 @@ impl Backend for FakeBackend {
         &mut self,
         _w: Option<Duration>,
         _p: jb_core::progress::ProgressFn,
-    ) -> anyhow::Result<Identity> {
+    ) -> Result<Identity, ConnectError> {
+        if self.attentions.get() > 0 {
+            self.attentions.set(self.attentions.get() - 1);
+            return Err(ConnectError::Attention {
+                notice: vec!["кажется, первое поколение".into()],
+            });
+        }
         Ok(self.identity.clone())
     }
     fn platform(&mut self) -> &mut dyn jb_core::scenario::Platform {
@@ -97,14 +107,28 @@ impl Backend for FakeBackend {
     }
 }
 
+fn fake_identity() -> Identity {
+    Identity {
+        model: Model::Capsula,
+        key: "KEY".into(),
+        firstgen: false,
+        caveats: vec![],
+    }
+}
+
 fn fake_for_model(_: Model) -> Box<dyn Backend> {
     Box::new(FakeBackend {
-        identity: Identity {
-            model: Model::Capsula,
-            key: "KEY".into(),
-            firstgen: false,
-            caveats: vec![],
-        },
+        identity: fake_identity(),
+        attentions: std::cell::Cell::new(0),
+    })
+}
+
+/// The fake that asks for the degraded-flow consent on the first
+/// connect (the rockchip first-generation path).
+fn firstgen_for_model(_: Model) -> Box<dyn Backend> {
+    Box::new(FakeBackend {
+        identity: fake_identity(),
+        attentions: std::cell::Cell::new(1),
     })
 }
 
@@ -144,8 +168,44 @@ fn worker_spawns_at_the_model_commit_and_advances() {
     a.activate(Focus::Model(0)); // commit -> spawn + Waiting
     assert!(a.session.is_some());
     assert_eq!(a.screen, Screen::Waiting);
+    // device seen -> Connecting -> the preparing screen -> Main
+    pump(&mut a, |a| a.screen == Screen::Preparing);
     pump(&mut a, |a| a.screen == Screen::Main);
     assert_eq!(a.identity.as_ref().unwrap().key, "KEY");
+}
+
+/// The rockchip first-generation settlement: the connect asks for the
+/// degraded-flow consent — the modal over the waiting screen; Continue
+/// (ModalOk) answers Proceed, the worker re-connects and lands on Main.
+#[test]
+fn firstgen_attention_modal_continues_to_main() {
+    let mut a = App::new(firstgen_for_model);
+    a.activate(Focus::Model(0));
+    pump(&mut a, |a| {
+        matches!(a.confirm, Some(Confirm::Firstgen { .. }))
+    });
+    // the modal sits over the waiting screen (the loader-mode hints)
+    assert_eq!(a.screen, Screen::Waiting);
+    assert_eq!(a.focus, Focus::ModalOk);
+    a.on_key(key(KeyCode::Enter)); // ModalOk -> Proceed
+    assert!(a.confirm.is_none());
+    pump(&mut a, |a| a.screen == Screen::Main);
+    assert_eq!(a.identity.as_ref().unwrap().key, "KEY");
+}
+
+/// Esc on the first-gen modal aborts the run: the worker dies with
+/// "прервано пользователем" and the error surfaces.
+#[test]
+fn firstgen_attention_esc_aborts() {
+    let mut a = App::new(firstgen_for_model);
+    a.activate(Focus::Model(0));
+    pump(&mut a, |a| {
+        matches!(a.confirm, Some(Confirm::Firstgen { .. }))
+    });
+    a.on_key(key(KeyCode::Esc));
+    assert!(a.confirm.is_none());
+    pump(&mut a, |a| a.error.is_some());
+    assert!(a.error.as_deref().unwrap().contains("прервано"));
 }
 
 #[test]

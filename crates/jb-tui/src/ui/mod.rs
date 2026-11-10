@@ -7,6 +7,7 @@
 mod main;
 mod modal;
 mod model_select;
+mod preparing;
 #[cfg(test)]
 mod tests;
 mod waiting;
@@ -23,6 +24,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::ModelSelect => model_select::render(f, app),
         Screen::Waiting => waiting::render(f, app),
+        Screen::Preparing => preparing::render(f, app),
         Screen::Main => main::render(f, app),
     }
     if app.confirm.is_some() {

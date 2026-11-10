@@ -23,15 +23,16 @@ pub struct BackupReport {
     pub partitions: usize,
     pub sectors_total: u64,
     /// The limit value before the RAM patch; None when running on the
-    /// stock loader (first generation) — there is no patch there.
+    /// stock loader (the degraded flow) — there is no patch there.
     pub read_limit_old: Option<u32>,
     /// The dumped images with their streamed checksums — the caller
     /// seals them into the v2 manifest (`backup_catalog::publish`).
     pub images: Vec<ImageEntry>,
-    /// Partitions whose content crossed the stock read mask (first
-    /// generation): the file is there, the content above the mask is
-    /// 0xCC garbage.
-    pub masked: Vec<String>,
+    /// Partitions NOT dumped: on the stock loader the capture cuts at
+    /// boot_a, and everything reaching past the read mask is garbage —
+    /// those partitions are skipped whole instead of dumping 0xCC
+    /// waste (on the Capsule map that leaves uboot, trust, misc).
+    pub skipped: Vec<String>,
 }
 
 /// Patch the usbplug read limit in RAM: without it,
@@ -90,19 +91,20 @@ pub fn cc_guard<T: Transport>(
     Ok(())
 }
 
-/// Back up every partition into `out_dir`. The caller has done
+/// Back up the partitions into `out_dir`. The caller has done
 /// bring_up: signatures verified, and seals the v2 manifest from the
 /// returned report (`backup_catalog::publish`) after writing the
 /// directory extras (serial.txt).
 ///
-/// On `stock_loader` (first generation, 330d u-boot) neither the RAM
-/// patch nor the guard is possible: everything above the stock read
-/// limit reads back as 0xCC. Those partitions still go into the dump
-/// full-size, filled with what the device returned (garbage), and the
-/// run ends with a NOT-intact warning. Caveat: the behavior of a
-/// READ_LBA spanning the mask boundary (boot_b) is unmeasured — its
-/// file gets the real prefix and/or 0xCC; the tail is not intact
-/// either way, the generic warning covers it.
+/// On `stock_loader` (the degraded flow: first generation or an
+/// incompatible-batch BootROM, 330d u-boot) neither the RAM patch nor
+/// the guard is possible: everything above the stock read limit reads
+/// back as 0xCC. The partial capture cuts at boot_a: everything from
+/// boot_a up (and anything else reaching past the read mask, like the
+/// straddling boot_b) is NOT dumped at all — the names go to `skipped`
+/// and the run ends with a partial-backup warning. What remains is the
+/// partitions before boot_a (on the Capsule map: uboot, trust, misc),
+/// each intact and restorable.
 pub fn backup<T: Transport>(
     s: &mut LoaderSession<T>,
     config: &Config,
@@ -148,27 +150,43 @@ pub fn backup<T: Transport>(
     )));
 
     let mut images: Vec<ImageEntry> = Vec::new();
-    let mut masked: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    // The degraded capture cuts at boot_a: everything from it up is
+    // skipped even though boot_a itself sits fully below the mask.
+    let cut_lba = gpt
+        .entries
+        .iter()
+        .find(|e| e.name == "boot_a")
+        .map(|e| e.first_lba);
     for e in &gpt.entries {
+        if stock_loader {
+            // On the stock loader everything from GUARD_LBA up reads
+            // back as 0xCC: a partition reaching past the mask (fully
+            // above it or straddling it, like boot_b) is garbage for
+            // the part the mask covers — skip it whole instead of
+            // dumping 0xCC waste.
+            let above_mask = e.first_lba + e.sectors > GUARD_LBA as u64;
+            let past_boot_a = cut_lba.is_some_and(|lba| e.first_lba >= lba);
+            if above_mask || past_boot_a {
+                skipped.push(e.name.clone());
+                let why = if past_boot_a && !above_mask {
+                    "от boot_a и выше не снимается".to_string()
+                } else {
+                    "выше маски чтения (32 МиБ)".to_string()
+                };
+                progress(Progress::Step(format!(
+                    "{name}: {why} — пропускаю",
+                    name = e.name
+                )));
+                continue;
+            }
+        }
         let file_name = jb_core::backup_store::BackupStore::image_name(e.idx, &e.name);
         let path = out_dir.join(&file_name);
         progress(Progress::PartitionStart {
             name: e.name.clone(),
             sectors: e.sectors,
         });
-        // On the stock loader everything from GUARD_LBA up reads back
-        // as 0xCC: a partition fully above the mask dumps as garbage,
-        // a straddling one (boot_b) keeps only its prefix below it.
-        let complete = if stock_loader && e.first_lba + e.sectors > GUARD_LBA as u64 {
-            masked.push(e.name.clone());
-            progress(Progress::Step(format!(
-                "{}: выше маски чтения — в дампе 0xCC",
-                e.name
-            )));
-            false
-        } else {
-            true
-        };
         let mut out = std::fs::File::create(&path)?;
         let mut hasher = Sha256::new();
         // one reusable full-chunk buffer; the last chunk of a partition
@@ -183,8 +201,9 @@ pub fn backup<T: Transport>(
             s.read_lba(lba, &mut chunk[..n * 512])?;
             // In usbplug mode a 0xCC first sector means the mask is
             // still active (the patch failed) — the whole dump would be
-            // garbage. On the stock loader it is the expected content
-            // of a masked partition; the mask accounting above covers it.
+            // garbage. On the stock loader masked partitions never
+            // reach this loop (skipped up front), so a 0xCC read here
+            // is wrong under both personas.
             if !stock_loader && done == 0 && chunk[..512].iter().all(|&b| b == 0xcc) {
                 let _ = std::fs::remove_file(&path);
                 return Err(UsbError::WrongMode(format!(
@@ -210,24 +229,27 @@ pub fn backup<T: Transport>(
                 e.sectors * 512
             )));
         }
-        // the checksum was streamed while dumping — no second pass
+        // the checksum was streamed while dumping — no second pass;
+        // everything dumped here sits fully below the stock read mask,
+        // so it is intact
         images.push(ImageEntry {
             partition: e.name.clone(),
             file: file_name,
             sha256: hex::encode(hasher.finalize()),
             size,
-            complete,
+            complete: true,
         });
         progress(Progress::PartitionDone {
             name: e.name.clone(),
         });
     }
 
-    if !masked.is_empty() {
+    if !skipped.is_empty() {
         progress(Progress::Step(format!(
-            "внимание: бэкап НЕцелостный — выше LBA {GUARD_LBA:#x} (32 МиБ) \
-             стоковый лоадер отдаёт 0xCC: {}",
-            masked.join(", ")
+            "внимание: бэкап частичный — снимаются только разделы до boot_a \
+             (от boot_a и выше 32 МиБ стоковый лоадер читает 0xCC), \
+             не снимались: {}",
+            skipped.join(", ")
         )));
     }
 
@@ -241,6 +263,6 @@ pub fn backup<T: Transport>(
         sectors_total: info.sector_total as u64,
         read_limit_old: old_limit,
         images,
-        masked,
+        skipped,
     })
 }
