@@ -2,9 +2,10 @@
 
 use super::*;
 use jb_core::backend::Backend;
+use jb_core::model::Model;
 use jb_core::progress::Progress;
 use jb_core::scenario::Prepared;
-use jb_core::session::{Event, Identity, Model};
+use jb_core::session::{Event, Identity};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 

@@ -326,7 +326,7 @@ fn backup_pipeline_on_mock() {
     // the caller publishes the v2 manifest and it verifies
     let manifest = jb_core::backup_catalog::BackupManifest {
         format: jb_core::backup_catalog::FORMAT,
-        model: jb_core::session::Model::Capsula,
+        model: jb_core::model::Model::Capsula,
         key: "TESTSERIAL".into(),
         created_utc: "2026-11-10T00:00:00Z".into(),
         tool_version: "test".into(),

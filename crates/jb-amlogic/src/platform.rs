@@ -23,10 +23,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use jb_core::backend::Backend;
 use jb_core::config::Config;
 use jb_core::format::humansize;
+use jb_core::model::Model;
 use jb_core::overlay::OverlayFile;
 use jb_core::progress::ProgressFn;
 use jb_core::scenario::{BackupState, Platform, Prepared, RestoreItem};
-use jb_core::session::{Identity, Model};
+use jb_core::session::Identity;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -182,7 +183,7 @@ impl Backend for Amlogic {
     }
 
     fn wait_hint(&self) -> Option<&str> {
-        Some(&self.config.hint.capsula_mini_amlogic_connect_text)
+        Some(self.config.connect_text(Model::CapsulaMiniAmlogic))
     }
 
     fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
@@ -607,7 +608,7 @@ fn capture_base(report: &BackupReport) -> Option<PathBuf> {
 /// The amlogic backup root: backup/capsule-mini/ (per-model layout —
 /// identity keys of different platforms may collide).
 fn backup_root() -> PathBuf {
-    Path::new("backup").join(Model::CapsulaMiniAmlogic.dir_name())
+    Path::new("backup").join(Model::CapsulaMiniAmlogic.name())
 }
 
 /// Raise a session: catch the 1b8e:c003 window (open the device

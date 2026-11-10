@@ -89,6 +89,10 @@ pub const PLATFORM_TPL_START: u32 = 0x80_0000;
 /// Size of tpl when the DTB sets it to zero ("until the next one").
 const TPL_SIZE: u32 = 0x80_0000;
 
+/// The checkpoint manifest's profile tag: every capture of this board
+/// carries it, and only captures with it are accepted on open.
+const PROFILE: &str = "capsula-mini-a113x";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -398,7 +402,7 @@ pub fn device_id(env_raw: &[u8]) -> anyhow::Result<String> {
 fn fresh_manifest() -> Manifest {
     Manifest {
         schema: 2,
-        profile: "capsula-mini-a113x".into(),
+        profile: PROFILE.into(),
         nand_size: nand::NAND_SIZE,
         page_size: nand::PAGE_SIZE,
         oob_size: nand::OOB_SIZE,
@@ -514,7 +518,7 @@ pub fn publish_v2(path: &Path) -> anyhow::Result<Option<jb_core::backup_catalog:
     };
     let manifest = catalog::BackupManifest {
         format: catalog::FORMAT,
-        model: jb_core::session::Model::CapsulaMiniAmlogic,
+        model: jb_core::model::Model::CapsulaMiniAmlogic,
         key: path
             .file_name()
             .map(|k| k.to_string_lossy().into_owned())
@@ -585,7 +589,7 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
     let m: Manifest = serde_json::from_slice(&std::fs::read(&mp)?)
         .with_context(|| format!("манифест в {} не читается", dir_path.display()))?;
     ensure!(
-        m.schema == 2 && m.profile == "capsula-mini-a113x",
+        m.schema == 2 && m.profile == PROFILE,
         "каталог {} чужой схемы ({} schema {}) — разберитесь вручную",
         dir_path.display(),
         m.profile,
@@ -652,7 +656,7 @@ pub fn capture_pass<T: Transport>(
     let mut m: Manifest = serde_json::from_slice(&std::fs::read(dir_path.join("manifest.json"))?)
         .context("манифест захвата не читается")?;
     ensure!(
-        m.schema == 2 && m.profile == "capsula-mini-a113x",
+        m.schema == 2 && m.profile == PROFILE,
         "неподдерживаемая схема захвата"
     );
     ensure!(
@@ -1094,7 +1098,7 @@ pub fn verify(path: &Path) -> anyhow::Result<BackupReport> {
 fn validate(path: &Path, m: &Manifest) -> anyhow::Result<()> {
     ensure!(
         m.schema == 2
-            && m.profile == "capsula-mini-a113x"
+            && m.profile == PROFILE
             && m.nand_size > 0
             && m.page_size == nand::PAGE_SIZE
             && m.oob_size == nand::OOB_SIZE
@@ -1396,7 +1400,7 @@ mod tests {
         let dir = CaptureDirectory::create(parent.path(), "aml").unwrap();
         let m = Manifest {
             schema: 2,
-            profile: "capsula-mini-a113x".into(),
+            profile: PROFILE.into(),
             nand_size: NAND,
             page_size: nand::PAGE_SIZE,
             oob_size: nand::OOB_SIZE,
@@ -1702,7 +1706,7 @@ mod tests {
         let entry = publish_v2(&dir).unwrap().expect("v2 entry");
         assert_eq!(
             entry.manifest.model,
-            jb_core::session::Model::CapsulaMiniAmlogic
+            jb_core::model::Model::CapsulaMiniAmlogic
         );
         assert_eq!(entry.manifest.status, catalog::Status::Complete);
         assert_eq!(

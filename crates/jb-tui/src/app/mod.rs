@@ -12,9 +12,10 @@ mod tests;
 pub use input::Focus;
 
 use jb_core::backend::Backend;
+use jb_core::model::Model;
 use jb_core::progress::Progress;
 use jb_core::scenario::WritePlan;
-use jb_core::session::{Event, Identity, Model, Session};
+use jb_core::session::{Event, Identity, Session};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;

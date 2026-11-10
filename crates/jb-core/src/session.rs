@@ -10,56 +10,16 @@
 //! closes — that aborts).
 
 use crate::backend::Backend;
+use crate::model::Model;
 use crate::progress::Progress;
 use crate::scenario::{self, BackupState, Params, WritePlan};
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 /// The bus poll cadence while waiting for a device (the amlogic
 /// download window is ~450 ms; the rockchip monitor polls at 50 ms).
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// The supported speaker models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Model {
-    /// The big Capsula (RK3308, rockchip).
-    Capsula,
-    /// The late-revision Capsula Mini (A113X, amlogic).
-    CapsulaMiniAmlogic,
-}
-
-impl Model {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Model::Capsula => "Капсула (Большая)",
-            Model::CapsulaMiniAmlogic => "Капсула Мини (Amlogic)",
-        }
-    }
-
-    /// The backup layout segment for the model: backups live in
-    /// `backup/<dir_name>/<key>/` — identity keys of different
-    /// platforms may collide, so the layout is per-model.
-    pub fn dir_name(&self) -> &'static str {
-        match self {
-            Model::Capsula => "capsula",
-            Model::CapsulaMiniAmlogic => "capsula-mini-amlogic",
-        }
-    }
-
-    /// Parse the canonical model name — the CLI `--model` value, the
-    /// `backup-delete` argument and the backup layout segment all use
-    /// the same vocabulary: capsula | capsula-mini-amlogic.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "capsula" => Some(Model::Capsula),
-            "capsula-mini-amlogic" => Some(Model::CapsulaMiniAmlogic),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Identity {

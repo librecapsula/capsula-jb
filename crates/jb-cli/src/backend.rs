@@ -6,7 +6,7 @@
 //! [`for_model`].
 
 use jb_core::backend::Backend;
-use jb_core::session::Model;
+use jb_core::model::Model;
 
 /// The backend of the model.
 pub(crate) fn for_model(model: Model) -> Box<dyn Backend> {

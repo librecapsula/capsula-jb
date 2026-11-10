@@ -34,6 +34,11 @@ jb-cli → jb-tui → jb-core ← jb-rockchip / jb-amlogic
 - **jb-core** — контракт и общий домен, без USB-транспорта и UI:
   `backend` (трейт платформы: `present` / `wait_hint` / `connect` —
   идентичность без дампа и записей — / `platform` — доступ к хукам),
+  `model` (единый реестр моделей колонок: `Model::ALL` — порядок меню
+  TUI и скана каталога, `label()` — подпись, `name()` — каноническое
+  имя, оно же значение `--model`, сегмент `backup/<name>/` и serde-имя
+  в `backup.json`, `from_name()`/`names()` — парсинг и словарь для
+  сообщений; новое место, где перечисляются колонки, — только здесь),
   `session` (событийная модель: воркер-нить владеет бэкендами,
   команды `Command::{Jailbreak,Backup,Restore}` и события
   `Event::{WaitingForDevice,DeviceConnected,BackupState,Progress,
@@ -48,7 +53,8 @@ jb-cli → jb-tui → jb-core ← jb-rockchip / jb-amlogic
   `backup_catalog` (единый манифест бэкапов v2 `backup.json`,
   публикация/чтение/верификация/каталог), `backup_store` (низкоуровневые
   помощники: имена, sha256, CaptureDirectory для amlogic-чекпоинтов),
-  `config`, `format`.
+  `config` (в т.ч. хинты подключения `hint.connect_text` по
+  каноническому имени модели), `format`.
 - **jb-rockchip** (RK3308) — домен: bring-up по персонам rockusb
   (`session`: `bring_up` с целью `Goal::{StockLoader,UsbPlug}` —
   connect остаётся на стоковом лоадере, выгрузка usbplug происходит
@@ -71,7 +77,8 @@ jb-cli → jb-tui → jb-core ← jb-rockchip / jb-amlogic
 - **jb-cli** — только бинарник: аргументы, фабрика платформ
   (`backend::for_model`; модель указывается ДО старта сессии — в CLI
   обязательный для сценариевых команд `--model capsula |
-  capsula-mini-amlogic` (имена = `Model::from_name`/`dir_name`), в
+  capsula-mini-amlogic` (значение типизировано реестром
+  `Model::ALL`, возможные значения показывает clap), в
   TUI — меню; воркер сессии получает бэкенд одной выбранной модели и
   опрашивает шину только через её `Backend::present` — колонка другой
   платформы на шине не видна в принципе), цикл событий сессии для CLI

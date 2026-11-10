@@ -14,7 +14,7 @@ mod ui;
 
 use anyhow::Result;
 use jb_core::backend::Backend;
-use jb_core::session::Model;
+use jb_core::model::Model;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEventKind,
@@ -93,12 +93,8 @@ fn restore_terminal() {
 
 /// The connection instructions of a model, from the embedded config —
 /// the same texts the CLI prints as wait hints.
-pub(crate) fn hint_text(model: jb_core::session::Model) -> String {
-    let config = jb_core::config::Config::embedded();
-    match model {
-        jb_core::session::Model::Capsula => config.hint.capsula_connect_text.clone(),
-        jb_core::session::Model::CapsulaMiniAmlogic => {
-            config.hint.capsula_mini_amlogic_connect_text.clone()
-        }
-    }
+pub(crate) fn hint_text(model: Model) -> String {
+    jb_core::config::Config::embedded()
+        .connect_text(model)
+        .to_owned()
 }

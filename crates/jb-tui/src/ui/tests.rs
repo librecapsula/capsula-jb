@@ -4,7 +4,8 @@
 use super::render;
 use crate::app::{App, Busy, Focus, Screen};
 use jb_core::backend::Backend;
-use jb_core::session::{Identity, Model};
+use jb_core::model::Model;
+use jb_core::session::Identity;
 
 /// A backend that is never present: the session worker of the tests
 /// polls quietly and never connects (the click tests drive the state

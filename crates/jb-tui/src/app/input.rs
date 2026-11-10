@@ -2,6 +2,7 @@
 //! control activation.
 
 use super::{App, BackupSnapshot, Busy, Confirm, Screen};
+use jb_core::model::Model;
 use jb_core::session::Session;
 
 /// A focusable control.
@@ -20,9 +21,9 @@ pub enum Focus {
 }
 
 impl Focus {
-    /// The focus cycle order of the current screen.
-    fn ring(app: &App) -> &'static [Focus] {
-        const MODEL: &[Focus] = &[Focus::Model(0), Focus::Model(1)];
+    /// The focus cycle order of the current screen. The model rows
+    /// follow the registry (`Model::ALL`), the rest are fixed.
+    fn ring(app: &App) -> Vec<Focus> {
         const MAIN: &[Focus] = &[
             Focus::TakeBackup,
             Focus::Restore,
@@ -34,10 +35,10 @@ impl Focus {
         ];
         const MODAL: &[Focus] = &[Focus::ModalOk, Focus::ModalCancel];
         match app.confirm {
-            Some(_) => MODAL,
+            Some(_) => MODAL.to_vec(),
             None => match app.screen {
-                Screen::ModelSelect => MODEL,
-                _ => MAIN,
+                Screen::ModelSelect => (0..Model::ALL.len()).map(Focus::Model).collect(),
+                _ => MAIN.to_vec(),
             },
         }
     }
@@ -187,11 +188,7 @@ impl App {
     pub(crate) fn activate(&mut self, focus: Focus) {
         match focus {
             Focus::Model(i) if self.screen == Screen::ModelSelect => {
-                self.selected_model = if i == 0 {
-                    jb_core::session::Model::Capsula
-                } else {
-                    jb_core::session::Model::CapsulaMiniAmlogic
-                };
+                self.selected_model = Model::ALL[i];
                 // The worker starts here — the chosen model gates the
                 // platform, its backend is the only one polled.
                 self.session = Some(Session::spawn(

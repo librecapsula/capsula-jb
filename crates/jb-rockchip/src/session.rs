@@ -13,6 +13,7 @@
 
 use crate::firstgen::is_first_generation;
 use jb_core::config::Config;
+use jb_core::model::Model;
 use jb_core::progress::{Progress, ProgressFn};
 use rockusb::loader::{LoaderSession, RESET_SUBCODE_MASKROM};
 use rockusb::monitor::wait_download_mode;
@@ -189,7 +190,7 @@ pub fn bring_up<B: Bus>(
     goal: Goal,
     progress: ProgressFn,
 ) -> Result<BroughtUp<B::T>, BringUpError> {
-    let hint = &config.hint.capsula_connect_text;
+    let hint = config.connect_text(Model::Capsula);
     let mut serial: Option<String> = None;
     // Set (with the refusal timestamp) once an unknown-identity persona
     // has been refused; afterwards only the loader persona (330d) may
@@ -313,7 +314,7 @@ pub fn reattach<B: Bus>(
     firstgen: bool,
     progress: ProgressFn,
 ) -> Result<LoaderSession<B::T>, BringUpError> {
-    let hint = &config.hint.capsula_connect_text;
+    let hint = config.connect_text(Model::Capsula);
     loop {
         let mode = bus.poll()?;
         let Some(mode) = mode else {

@@ -9,12 +9,21 @@ mod progress;
 mod util;
 
 use anyhow::bail;
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 
 use jb_core::format::humansize;
+use jb_core::model::Model;
 use jb_core::scenario::{Params, WritePlan};
 use jb_core::session::{Command as SessionCommand, Decision, Event, Session};
 use std::time::Duration;
+
+/// The `--model` / `backup-delete <model>` value parser over the model
+/// registry: clap validates and lists the possible values itself.
+fn model_parser() -> impl TypedValueParser<Value = Model> {
+    PossibleValuesParser::new(Model::ALL.iter().map(|m| m.name()))
+        .map(|name: String| Model::from_name(&name).expect("possible value"))
+}
 
 #[derive(Parser)]
 #[command(
@@ -23,10 +32,10 @@ use std::time::Duration;
     about = "Джейлбрейк VK Capsula: дамп → оверлей adbd в userdata → ADB"
 )]
 struct Cli {
-    /// The speaker model this run targets (capsula |
-    /// capsula-mini-amlogic); required by the device commands
-    #[arg(long, value_name = "MODEL", global = true)]
-    model: Option<String>,
+    /// The speaker model this run targets; required by the device
+    /// commands (possible values come from the model registry)
+    #[arg(long, value_name = "MODEL", global = true, value_parser = model_parser())]
+    model: Option<Model>,
 
     /// How many seconds to wait for the speaker on USB (0 = forever)
     #[arg(long, value_name = "SEC", default_value = "0", global = true)]
@@ -73,8 +82,9 @@ enum Command {
     /// (the TUI's "delete backup" button)
     #[command(name = "backup-delete")]
     BackupDelete {
-        /// The model: capsula | capsula-mini-amlogic
-        model: String,
+        /// The model the backup belongs to
+        #[arg(value_parser = model_parser())]
+        model: Model,
         /// The column key: the serial (capsula) or the deviceid (capsula-mini-amlogic)
         key: String,
     },
@@ -148,16 +158,14 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
     match &cli.command {
         Some(Command::Monitor) => return monitor_bus(),
         Some(Command::Backups { verify }) => return list_backups(*verify),
-        Some(Command::BackupDelete { model, key }) => return delete_backup(model, key, cli.yes),
+        Some(Command::BackupDelete { model, key }) => return delete_backup(*model, key, cli.yes),
         _ => {}
     }
     // The model comes first: the session worker polls only its backend,
     // so a device of the other platform on the bus is not even seen.
-    let model = match cli.model.as_deref() {
-        Some(name) => jb_core::session::Model::from_name(name).ok_or_else(|| {
-            anyhow::anyhow!("неизвестная модель {name:?} (capsula | capsula-mini-amlogic)")
-        })?,
-        None => bail!("укажите модель: --model capsula | capsula-mini-amlogic"),
+    let model = match cli.model {
+        Some(model) => model,
+        None => bail!("укажите модель: --model {}", Model::names()),
     };
     let session = Session::spawn(vec![backend::for_model(model)], wait);
     session.command(match &cli.command {
@@ -348,13 +356,10 @@ fn list_backups(verify: bool) -> anyhow::Result<()> {
 /// TUI's "delete backup" button. The confirmation follows the write
 /// rules: interactive [y/N], non-interactive (agents) refuses and
 /// points at --yes.
-fn delete_backup(model: &str, key: &str, yes: bool) -> anyhow::Result<()> {
-    let model = jb_core::session::Model::from_name(model).ok_or_else(|| {
-        anyhow::anyhow!("неизвестная модель {model:?} (capsula | capsula-mini-amlogic)")
-    })?;
+fn delete_backup(model: Model, key: &str, yes: bool) -> anyhow::Result<()> {
     let Some(entry) = jb_core::backup_catalog::open(std::path::Path::new("backup"), model, key)
     else {
-        bail!("бэкап не найден: backup/{}/{key}", model.dir_name());
+        bail!("бэкап не найден: backup/{}/{key}", model.name());
     };
     log::info!(
         "удалить бэкап {} · {} · {}?",

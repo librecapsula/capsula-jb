@@ -8,7 +8,7 @@
 //! v2 over it.
 
 use crate::backup_store::{BackupStore, StoreError, file_sha256};
-use crate::session::Model;
+use crate::model::Model;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -169,14 +169,14 @@ pub fn read(dir: &Path) -> Option<BackupEntry> {
 /// (`backup/<model>/<key>/`): identity keys of different platforms may
 /// collide.
 pub fn open(root: &Path, model: Model, key: &str) -> Option<BackupEntry> {
-    read(&root.join(model.dir_name()).join(BackupStore::dir_name(key)))
+    read(&root.join(model.name()).join(BackupStore::dir_name(key)))
 }
 
 /// All v2 backups under a root directory (`backup/`), oldest first.
 pub fn scan(root: &Path) -> Vec<BackupEntry> {
     let mut out = Vec::new();
-    for model in [Model::Capsula, Model::CapsulaMiniAmlogic] {
-        let Ok(rd) = std::fs::read_dir(root.join(model.dir_name())) else {
+    for model in Model::ALL {
+        let Ok(rd) = std::fs::read_dir(root.join(model.name())) else {
             continue;
         };
         for e in rd.flatten() {
@@ -301,7 +301,7 @@ mod tests {
             (Model::Capsula, "a.img"),
             (Model::CapsulaMiniAmlogic, "a.bin"),
         ] {
-            let dir = root.join(model.dir_name()).join("SAMEKEY");
+            let dir = root.join(model.name()).join("SAMEKEY");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(file), b"x").unwrap();
             let mut m = manifest("SAMEKEY", vec![]);

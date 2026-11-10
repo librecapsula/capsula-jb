@@ -17,10 +17,11 @@ use jb_core::backup_catalog::{self as catalog, BackupManifest};
 use jb_core::backup_store::BackupStore;
 use jb_core::config::Config;
 use jb_core::format::humansize;
+use jb_core::model::Model;
 use jb_core::overlay::OverlayFile;
 use jb_core::progress::ProgressFn;
 use jb_core::scenario::{BackupState, Platform, Prepared, RestoreItem};
-use jb_core::session::{Identity, Model};
+use jb_core::session::Identity;
 use rockusb::NusbTransport;
 use rockusb::loader::RESET_SUBCODE_NORMAL;
 use std::path::{Path, PathBuf};
@@ -99,7 +100,7 @@ impl Backend for Rockchip {
     }
 
     fn wait_hint(&self) -> Option<&str> {
-        Some(&self.config.hint.capsula_connect_text)
+        Some(self.config.connect_text(Model::Capsula))
     }
 
     fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
@@ -426,7 +427,7 @@ impl Platform for Rockchip {
 /// collide).
 fn backup_dir(serial: &str) -> PathBuf {
     Path::new("backup")
-        .join(Model::Capsula.dir_name())
+        .join(Model::Capsula.name())
         .join(BackupStore::dir_name(serial))
 }
 
