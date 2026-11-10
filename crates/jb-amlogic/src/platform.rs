@@ -182,7 +182,7 @@ impl Backend for Amlogic {
     }
 
     fn wait_hint(&self) -> Option<&str> {
-        Some(&self.config.hint.amlogic_text)
+        Some(&self.config.hint.capsula_mini_amlogic_connect_text)
     }
 
     fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
@@ -199,7 +199,7 @@ impl Backend for Amlogic {
         self.session = Some(s);
         self.env_raw = Some(env_raw);
         Ok(Identity {
-            model: Model::CapsuleMini,
+            model: Model::CapsulaMiniAmlogic,
             key: deviceid,
             firstgen: false,
             caveats: vec![],
@@ -303,7 +303,7 @@ impl Platform for Amlogic {
         // The v2 manifest metadata first (no hashing here — the
         // checksum pass runs in ensure_backup); unfinished directories
         // are surfaced through the schema-2 checkpoint status.
-        match jb_core::backup_catalog::open(Path::new("backup"), Model::CapsuleMini, &deviceid) {
+        match jb_core::backup_catalog::open(Path::new("backup"), Model::CapsulaMiniAmlogic, &deviceid) {
             Some(e) if e.manifest.status == jb_core::backup_catalog::Status::Complete => {
                 BackupState::Verified { dir: e.dir }
             }
@@ -399,7 +399,7 @@ impl Platform for Amlogic {
             .ok_or_else(|| anyhow!("устройство не подключено"))?;
         let deviceid = capture::device_id(&env_raw)?;
         let entry =
-            jb_core::backup_catalog::open(Path::new("backup"), Model::CapsuleMini, &deviceid)
+            jb_core::backup_catalog::open(Path::new("backup"), Model::CapsulaMiniAmlogic, &deviceid)
                 .ok_or_else(|| {
                     anyhow!(
                         "восстановление невозможно: нет верифицированного захвата {} \
@@ -600,7 +600,7 @@ fn capture_base(report: &BackupReport) -> Option<PathBuf> {
 /// The amlogic backup root: backup/capsule-mini/ (per-model layout —
 /// identity keys of different platforms may collide).
 fn backup_root() -> PathBuf {
-    Path::new("backup").join(Model::CapsuleMini.dir_name())
+    Path::new("backup").join(Model::CapsulaMiniAmlogic.dir_name())
 }
 
 /// Raise a session: catch the 1b8e:c003 window (open the device

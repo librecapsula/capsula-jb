@@ -175,7 +175,7 @@ pub fn open(root: &Path, model: Model, key: &str) -> Option<BackupEntry> {
 /// All v2 backups under a root directory (`backup/`), oldest first.
 pub fn scan(root: &Path) -> Vec<BackupEntry> {
     let mut out = Vec::new();
-    for model in [Model::Capsule, Model::CapsuleMini] {
+    for model in [Model::Capsula, Model::CapsulaMiniAmlogic] {
         let Ok(rd) = std::fs::read_dir(root.join(model.dir_name())) else {
             continue;
         };
@@ -206,7 +206,7 @@ mod tests {
     fn manifest(key: &str, images: Vec<ImageEntry>) -> BackupManifest {
         BackupManifest {
             format: FORMAT,
-            model: Model::Capsule,
+            model: Model::Capsula,
             key: key.into(),
             created_utc: "2026-11-10T00:00:00Z".into(),
             tool_version: "test".into(),
@@ -288,7 +288,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("SUCCESS.txt"), "SUCCESS\n").unwrap();
         assert!(read(&dir).is_none());
-        assert!(open(&root, Model::Capsule, "OLDSERIAL").is_none());
+        assert!(open(&root, Model::Capsula, "OLDSERIAL").is_none());
         assert!(scan(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -297,7 +297,7 @@ mod tests {
     fn scan_lists_entries_and_open_finds_by_model_and_key() {
         let root = tmp("scan");
         // same key under two models — no collision
-        for (model, file) in [(Model::Capsule, "a.img"), (Model::CapsuleMini, "a.bin")] {
+        for (model, file) in [(Model::Capsula, "a.img"), (Model::CapsulaMiniAmlogic, "a.bin")] {
             let dir = root.join(model.dir_name()).join("SAMEKEY");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(file), b"x").unwrap();
@@ -313,9 +313,9 @@ mod tests {
             publish(&dir, m).unwrap();
         }
         assert_eq!(scan(&root).len(), 2);
-        assert!(open(&root, Model::Capsule, "SAMEKEY").is_some());
-        assert!(open(&root, Model::CapsuleMini, "SAMEKEY").is_some());
-        assert!(open(&root, Model::Capsule, "OTHER").is_none());
+        assert!(open(&root, Model::Capsula, "SAMEKEY").is_some());
+        assert!(open(&root, Model::CapsulaMiniAmlogic, "SAMEKEY").is_some());
+        assert!(open(&root, Model::Capsula, "OTHER").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

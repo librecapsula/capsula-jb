@@ -90,7 +90,7 @@ fn main_screen_app() -> App {
     let mut a = app();
     a.screen = Screen::Main;
     a.identity = Some(Identity {
-        model: Model::Capsule,
+        model: Model::Capsula,
         key: "SN".into(),
         firstgen: false,
         caveats: vec![],

@@ -97,7 +97,7 @@ fn restore_terminal() {
 pub(crate) fn hint_text(model: jb_core::session::Model) -> String {
     let config = jb_core::config::Config::embedded();
     match model {
-        jb_core::session::Model::Capsule => config.hint.text.clone(),
-        jb_core::session::Model::CapsuleMini => config.hint.amlogic_text.clone(),
+        jb_core::session::Model::Capsula => config.hint.capsula_connect_text.clone(),
+        jb_core::session::Model::CapsulaMiniAmlogic => config.hint.capsula_mini_amlogic_connect_text.clone(),
     }
 }

@@ -189,7 +189,7 @@ pub fn bring_up<B: Bus>(
     goal: Goal,
     progress: ProgressFn,
 ) -> Result<BroughtUp<B::T>, BringUpError> {
-    let hint = &config.hint.text;
+    let hint = &config.hint.capsula_connect_text;
     let mut serial: Option<String> = None;
     // Set (with the refusal timestamp) once an unknown-identity persona
     // has been refused; afterwards only the loader persona (330d) may
@@ -313,7 +313,7 @@ pub fn reattach<B: Bus>(
     firstgen: bool,
     progress: ProgressFn,
 ) -> Result<LoaderSession<B::T>, BringUpError> {
-    let hint = &config.hint.text;
+    let hint = &config.hint.capsula_connect_text;
     loop {
         let mode = bus.poll()?;
         let Some(mode) = mode else {

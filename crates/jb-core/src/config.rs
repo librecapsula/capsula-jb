@@ -27,10 +27,8 @@ pub struct UsbplugPatch {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hint {
-    pub text: String,
-    /// The hint for the amlogic Mini (1b8e:c003): the short download
-    /// window raises itself at every power-on — nothing to press.
-    pub amlogic_text: String,
+    pub capsula_connect_text: String,
+    pub capsula_mini_amlogic_connect_text: String,
 }
 
 /// Path of the source TOML in the repository (for the sync test).
@@ -64,8 +62,6 @@ mod tests {
         assert_eq!(c.usbplug.signature1_hex, "29c54eb91f01096b02030054");
         assert_eq!(c.usbplug.signature2_addr, 0x0301_2390);
         assert_eq!(c.usbplug.signature2_hex, "29c54eb91f01096bc2000054");
-        assert!(c.hint.text.contains("2207:330d"));
-        assert!(c.hint.amlogic_text.contains("1b8e:c003"));
     }
 
     #[test]

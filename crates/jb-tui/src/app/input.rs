@@ -190,9 +190,9 @@ impl App {
         match focus {
             Focus::Model(i) if self.screen == Screen::ModelSelect => {
                 self.selected_model = if i == 0 {
-                    jb_core::session::Model::Capsule
+                    jb_core::session::Model::Capsula
                 } else {
-                    jb_core::session::Model::CapsuleMini
+                    jb_core::session::Model::CapsulaMiniAmlogic
                 };
             }
             Focus::ModelNext => {

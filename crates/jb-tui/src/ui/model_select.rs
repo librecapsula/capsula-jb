@@ -15,10 +15,10 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Length(6), Constraint::Min(1)]).areas(f.area());
 
     let models = [
-        (Model::Capsule, "Большая Капсула (USB 2207:…)"),
+        (Model::Capsula, "Капсула (Большая)"),
         (
-            Model::CapsuleMini,
-            "Капсула Мини, поздние ревизии (USB 1b8e:c003)",
+            Model::CapsulaMiniAmlogic,
+            "Капсула Мини (Amlogic)",
         ),
     ];
     let mut lines = Vec::new();

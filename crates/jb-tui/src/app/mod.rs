@@ -144,7 +144,7 @@ impl App {
             session,
             screen: Screen::ModelSelect,
             quit: false,
-            selected_model: Model::Capsule,
+            selected_model: Model::Capsula,
             hints: Vec::new(),
             identity: None,
             backup: BackupSnapshot::Unknown,

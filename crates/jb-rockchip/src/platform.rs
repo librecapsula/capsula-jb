@@ -99,7 +99,7 @@ impl Backend for Rockchip {
     }
 
     fn wait_hint(&self) -> Option<&str> {
-        Some(&self.config.hint.text)
+        Some(&self.config.hint.capsula_connect_text)
     }
 
     fn connect(&mut self, wait: Option<Duration>, progress: ProgressFn) -> Result<Identity> {
@@ -114,7 +114,7 @@ impl Backend for Rockchip {
             );
         }
         let identity = Identity {
-            model: Model::Capsule,
+            model: Model::Capsula,
             key: dev.serial.clone(),
             firstgen: dev.firstgen,
             caveats: if dev.firstgen {
@@ -426,7 +426,7 @@ impl Platform for Rockchip {
 /// collide).
 fn backup_dir(serial: &str) -> PathBuf {
     Path::new("backup")
-        .join(Model::Capsule.dir_name())
+        .join(Model::Capsula.dir_name())
         .join(BackupStore::dir_name(serial))
 }
 
@@ -594,7 +594,7 @@ impl Rockchip {
         let masked = &report.masked;
         let manifest = BackupManifest {
             format: catalog::FORMAT,
-            model: Model::Capsule,
+            model: Model::Capsula,
             key: dir
                 .file_name()
                 .map(|k| k.to_string_lossy().into_owned())

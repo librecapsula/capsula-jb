@@ -514,7 +514,7 @@ pub fn publish_v2(path: &Path) -> anyhow::Result<Option<jb_core::backup_catalog:
     };
     let manifest = catalog::BackupManifest {
         format: catalog::FORMAT,
-        model: jb_core::session::Model::CapsuleMini,
+        model: jb_core::session::Model::CapsulaMiniAmlogic,
         key: path
             .file_name()
             .map(|k| k.to_string_lossy().into_owned())
@@ -1700,7 +1700,7 @@ mod tests {
         // the real capture_pass publishes v2 at its finalize step; the
         // test harness bypasses it, so publish explicitly here
         let entry = publish_v2(&dir).unwrap().expect("v2 entry");
-        assert_eq!(entry.manifest.model, jb_core::session::Model::CapsuleMini);
+        assert_eq!(entry.manifest.model, jb_core::session::Model::CapsulaMiniAmlogic);
         assert_eq!(entry.manifest.status, catalog::Status::Complete);
         assert_eq!(
             entry.manifest.key,

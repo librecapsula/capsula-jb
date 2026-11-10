@@ -26,16 +26,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[serde(rename_all = "kebab-case")]
 pub enum Model {
     /// The big Capsula (RK3308, rockchip).
-    Capsule,
+    Capsula,
     /// The late-revision Capsula Mini (A113X, amlogic).
-    CapsuleMini,
+    CapsulaMiniAmlogic,
 }
 
 impl Model {
     pub fn label(&self) -> &'static str {
         match self {
-            Model::Capsule => "Капсула",
-            Model::CapsuleMini => "Капсула Мини",
+            Model::Capsula => "Капсула",
+            Model::CapsulaMiniAmlogic => "Капсула Мини",
         }
     }
 
@@ -44,8 +44,8 @@ impl Model {
     /// platforms may collide, so the layout is per-model.
     pub fn dir_name(&self) -> &'static str {
         match self {
-            Model::Capsule => "capsule",
-            Model::CapsuleMini => "capsule-mini",
+            Model::Capsula => "capsule",
+            Model::CapsulaMiniAmlogic => "capsule-mini",
         }
     }
 }
@@ -258,7 +258,7 @@ mod tests {
                 polls: RefCell::new(0),
                 calls: RefCell::new(vec![]),
                 identity: Identity {
-                    model: Model::Capsule,
+                    model: Model::Capsula,
                     key: "TESTSERIAL".into(),
                     firstgen: false,
                     caveats: vec![],

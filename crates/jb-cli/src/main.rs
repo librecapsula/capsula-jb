@@ -348,8 +348,8 @@ fn list_backups(verify: bool) -> anyhow::Result<()> {
 /// points at --yes.
 fn delete_backup(model: &str, key: &str, yes: bool) -> anyhow::Result<()> {
     let model = match model {
-        "capsule" => jb_core::session::Model::Capsule,
-        "capsula-mini" => jb_core::session::Model::CapsuleMini,
+        "capsule" => jb_core::session::Model::Capsula,
+        "capsula-mini" => jb_core::session::Model::CapsulaMiniAmlogic,
         other => bail!("неизвестная модель {other:?} (capsule | capsula-mini)"),
     };
     let Some(entry) = jb_core::backup_catalog::open(std::path::Path::new("backup"), model, key)

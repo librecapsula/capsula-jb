@@ -100,7 +100,7 @@ fn app() -> App {
     App::new(Session::spawn(
         vec![Box::new(FakeBackend {
             identity: Identity {
-                model: Model::Capsule,
+                model: Model::Capsula,
                 key: "KEY".into(),
                 firstgen: false,
                 caveats: vec![],
@@ -134,14 +134,14 @@ fn screens_advance_and_model_switches_on_mismatch() {
     assert_eq!(a.screen, Screen::ModelSelect);
     a.on_key(key(KeyCode::Tab)); // Model(1)
     a.on_key(key(KeyCode::Enter)); // select Mini
-    assert_eq!(a.selected_model, Model::CapsuleMini);
+    assert_eq!(a.selected_model, Model::CapsulaMiniAmlogic);
     a.on_key(key(KeyCode::Tab)); // ModelNext
     a.on_key(key(KeyCode::Enter)); // -> Waiting
     assert_eq!(a.screen, Screen::Waiting);
     pump(&mut a, |a| a.screen == Screen::Main);
     // a Capsule connected while Mini was selected: switched
-    assert_eq!(a.identity.as_ref().unwrap().model, Model::Capsule);
-    assert_eq!(a.selected_model, Model::Capsule);
+    assert_eq!(a.identity.as_ref().unwrap().model, Model::Capsula);
+    assert_eq!(a.selected_model, Model::Capsula);
 }
 
 #[test]
