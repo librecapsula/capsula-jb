@@ -49,11 +49,16 @@ pub enum BackupState {
     None,
     /// A capture that opened and passed the checksum verification —
     /// usable as the patch base and for restore.
-    Verified { dir: PathBuf },
+    Verified {
+        dir: PathBuf,
+    },
     /// A capture exists but cannot serve as a base: taken with caveats
     /// (the first-generation 0xCC mask, amlogic bad blocks) or failed
     /// verification. `why` carries the reasons for the UI.
-    Unusable { dir: PathBuf, why: Vec<String> },
+    Unusable {
+        dir: PathBuf,
+        why: Vec<String>,
+    },
 }
 
 /// What [`Platform::ensure_backup`] delivers: the backup decision is

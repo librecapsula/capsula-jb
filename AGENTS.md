@@ -7,10 +7,11 @@
 ## Сборка и тесты
 
 - `cargo build --release` — нужен Rust и C-компилятор (lwext4
-  собирается через `cc`, см. `jb-rockchip/build.rs`). Версия Rust
-  запинена в `rust-toolchain.toml` (rustup ставит её сам, CI ставит
-  вызовом `rustup toolchain install` без аргумента); edition — 2024
-  (задаётся в `[workspace.package]`, крейты наследуют).
+  собирается через `cc`, см. `jb-rockchip/build.rs`). Версия Rust не
+  запинена: CI использует предустановленный на раннерах stable
+  (докачивает только компоненты clippy/rustfmt и кросс-таргеты),
+  локально — default-тулчейн rustup; edition — 2024 (задаётся в
+  `[workspace.package]`, крейты наследуют).
 - `cargo test --workspace` — тесты userdata гоняют настоящий lwext4 на
   синтетических образах и сериализованы общим мьютексом (у lwext4
   глобальное состояние); тесты UBIFS-сборки образа data — на

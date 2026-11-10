@@ -1,6 +1,0 @@
-# Single source of truth for the Rust version: local builds, CI and
-# releases all use this toolchain (rustup installs it on demand; the
-# CI "rustup toolchain install" step with no toolchain argument
-# follows this file). Bump it to the newest stable when raising.
-[toolchain]
-channel = "1.99.1"

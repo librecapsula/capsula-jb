@@ -88,7 +88,9 @@ pub enum Event {
         hints: Vec<String>,
     },
     /// A device connected and identified.
-    DeviceConnected { identity: Identity },
+    DeviceConnected {
+        identity: Identity,
+    },
     /// The connected column's backup situation (also re-emitted after
     /// every finished operation — a backup may have appeared).
     BackupState(BackupState),
