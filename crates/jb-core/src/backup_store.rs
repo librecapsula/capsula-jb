@@ -212,6 +212,18 @@ pub struct CaptureDirectory {
     path: PathBuf,
 }
 
+/// mkdir with mode 0700 on unix (capture directories stay private).
+#[cfg(unix)]
+fn create_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
+}
+
 impl CaptureDirectory {
     /// Create a uniquely-named capture directory (tests and tools that
     /// need an ad-hoc capture location).
@@ -230,13 +242,7 @@ impl CaptureDirectory {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
+            match create_dir(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -254,13 +260,7 @@ impl CaptureDirectory {
         safe_capture_name(name)?;
         std::fs::create_dir_all(parent)?;
         let path = parent.join(name);
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&path)?;
+        create_dir(&path)?;
         Ok(Self { path })
     }
 
