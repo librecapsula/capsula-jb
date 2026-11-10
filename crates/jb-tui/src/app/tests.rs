@@ -193,6 +193,20 @@ fn quit_is_blocked_while_busy() {
 }
 
 #[test]
+fn ctrl_c_quits_when_idle_and_is_gated_while_busy() {
+    let mut a = app();
+    a.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(a.quit);
+
+    let mut a = app();
+    pump(&mut a, |a| a.screen == Screen::Main);
+    a.activate(Focus::Flash);
+    a.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!a.quit);
+    assert!(a.notice.is_some());
+}
+
+#[test]
 fn settings_toggle_and_params() {
     let mut s = Settings::default();
     assert!(s.params().adbd);

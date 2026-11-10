@@ -88,6 +88,17 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(self.focus),
             KeyCode::Esc => self.escape(),
             KeyCode::Char('q') | KeyCode::Char('Q') => self.request_quit(),
+            // In raw mode Ctrl+C is not a SIGINT — it arrives as a key.
+            // Handle it like q: IDE "Stop" buttons (RustRover et al.)
+            // send Ctrl+C into the emulated terminal instead of a
+            // signal, so without this the process survives Stop.
+            KeyCode::Char('c')
+                if key
+                    .modifiers
+                    .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                self.request_quit()
+            }
             _ => {}
         }
     }
