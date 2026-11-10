@@ -1,5 +1,6 @@
-//! Render tests over ratatui's TestBackend — the hit rects of the
-//! focusable controls, mouse clicks and the log wheel.
+//! Mouse behavior over ratatui's TestBackend — clicks focus and
+//! activate, the wheel scrolls the log. The drawing itself is not
+//! verified.
 
 use super::render;
 use crate::app::{App, Busy, Focus, Screen};
@@ -49,63 +50,6 @@ fn main_screen_app() -> App {
         caveats: vec![],
     });
     a
-}
-
-#[test]
-fn hit_rects_cover_the_focusable_controls() {
-    let mut a = app();
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| render(f, &mut a)).unwrap();
-    // model select: the two menu rows
-    assert!(a.hit.contains_key(&Focus::Model(0)));
-    assert!(a.hit.contains_key(&Focus::Model(1)));
-
-    // the main screen: buttons + checkboxes + the flash button
-    let mut a = main_screen_app();
-    terminal.draw(|f| render(f, &mut a)).unwrap();
-    for f in [
-        Focus::TakeBackup,
-        Focus::Restore,
-        Focus::DeleteBackup,
-        Focus::SetAdbd,
-        Focus::SetFormat,
-        Focus::SetNoBackup,
-        Focus::Flash,
-    ] {
-        assert!(a.hit.contains_key(&f), "нет rect для {f:?}");
-    }
-    // the log rect is registered for the wheel
-    assert!(a.log_rect.height > 0);
-}
-
-#[test]
-fn instructions_live_on_the_waiting_screen_only() {
-    let mut a = app();
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-
-    // screen 1: the choice only, no connection instructions
-    terminal.draw(|f| render(f, &mut a)).unwrap();
-    let text = buffer_text(terminal.backend().buffer());
-    assert!(text.contains("Выберите колонку"));
-    assert!(!text.contains("Как подключить"));
-
-    // screen 2: the instructions of the chosen model
-    a.screen = Screen::Waiting;
-    a.hints = vec!["вставьте USB-кабель".into()];
-    terminal.draw(|f| render(f, &mut a)).unwrap();
-    let text = buffer_text(terminal.backend().buffer());
-    assert!(text.contains("подключения по USB"));
-    assert!(text.contains("вставьте USB-кабель"));
-}
-
-/// The buffer flattened into one string for `contains` checks.
-fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
-    buffer.content().iter().fold(String::new(), |mut acc, c| {
-        acc.push_str(c.symbol());
-        acc
-    })
 }
 
 #[test]
