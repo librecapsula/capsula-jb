@@ -1,8 +1,6 @@
 //! The TUI application state: the screen machine (model select →
 //! waiting → main), the busy/confirm modals, and the input routing.
-//! Everything is plain data + methods so the whole machine is testable
-//! without a terminal (see the tests at the bottom and the render
-//! tests in [`crate::ui`]).
+//! Plain data + methods, testable without a terminal.
 
 use jb_core::progress::Progress;
 use jb_core::scenario::{Params, WritePlan};
@@ -11,22 +9,17 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-/// Log lines kept in the pane (the tail of it is shown; the full tool
-/// log is stdout/stderr of the CLI mode, here the pane IS the log).
+/// Log lines kept in the pane.
 const LOG_CAP: usize = 2000;
 
-/// The screens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
-    /// 1: which column are we working with (drives the instructions).
     ModelSelect,
-    /// 2: waiting for the column on USB.
     Waiting,
-    /// 3: the working screen.
     Main,
 }
 
-/// The jailbreak settings (screen 3.3). Maps 1:1 onto
+/// The jailbreak settings; maps 1:1 onto
 /// [`jb_core::scenario::Params`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -70,7 +63,6 @@ pub enum Busy {
 /// delete).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupSnapshot {
-    /// Not connected yet.
     Unknown,
     None,
     Verified {
@@ -93,7 +85,7 @@ impl BackupSnapshot {
 
 use std::path::Path;
 
-/// The active progress line (screen 3.4).
+/// The active progress line.
 #[derive(Debug, Clone)]
 pub struct ActiveProgress {
     pub label: String,
@@ -101,8 +93,7 @@ pub struct ActiveProgress {
     pub total: u64,
 }
 
-/// A focusable control. Tab cycles within the current screen; a mouse
-/// click focuses and activates.
+/// A focusable control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Focus {
     Model(usize),
@@ -119,8 +110,7 @@ pub enum Focus {
 }
 
 impl Focus {
-    /// The cycle order of the current screen (the modal, when open,
-    /// captures the focus).
+    /// The focus cycle order of the current screen.
     fn ring(app: &App) -> &'static [Focus] {
         const MODEL: &[Focus] = &[Focus::Model(0), Focus::Model(1), Focus::ModelNext];
         const MAIN: &[Focus] = &[
@@ -154,7 +144,6 @@ impl Focus {
     }
 }
 
-/// An open modal.
 #[derive(Debug, Clone)]
 pub enum Confirm {
     /// The scenario asks to allow the write (the worker is BLOCKED
@@ -167,19 +156,15 @@ pub enum Confirm {
     DeleteBackup { dir: PathBuf },
 }
 
-/// The whole UI state.
 pub struct App {
     pub session: Session,
     pub screen: Screen,
     pub quit: bool,
 
-    // screen 1
     pub selected_model: Model,
 
-    // screen 2
     pub hints: Vec<String>,
 
-    // screen 3
     pub identity: Option<Identity>,
     pub backup: BackupSnapshot,
     pub settings: Settings,
@@ -198,8 +183,8 @@ pub struct App {
     pub log_scroll: u16,
 
     pub focus: Focus,
-    /// Rendered rects of the focusable controls, refreshed every frame
-    /// (the mouse hit-tests against them).
+    /// Rendered rects of the focusable controls, refreshed every frame;
+    /// the mouse hit-tests against them.
     pub hit: std::collections::HashMap<Focus, ratatui::layout::Rect>,
     pub log_rect: ratatui::layout::Rect,
 }
@@ -236,7 +221,6 @@ impl App {
         self.logs.push_back(line.into());
     }
 
-    /// A session event arrived (drained from the worker).
     pub fn on_session_event(&mut self, ev: Event) {
         match ev {
             Event::WaitingForDevice { hints } => {
@@ -344,12 +328,9 @@ impl App {
         }
     }
 
-    /// A terminal event (key/mouse). ` KeyEvent`/`MouseEvent` shapes
-    /// come from crossterm through ratatui.
     pub fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::KeyCode;
 
-        // The modal captures everything.
         if self.confirm.is_some() {
             match key.code {
                 KeyCode::Enter => self.activate(self.focus),
@@ -372,9 +353,8 @@ impl App {
             KeyCode::Tab => self.focus = Focus::next(self, false),
             KeyCode::BackTab => self.focus = Focus::next(self, true),
             KeyCode::Up | KeyCode::Left => {
-                // also scroll the log with arrows while it is focused?
-                // Arrows move the focus ring (the simple, predictable
-                // contract); the wheel scrolls the log.
+                // Arrows always move the focus ring; the wheel scrolls
+                // the log.
                 self.focus = Focus::next(self, true)
             }
             KeyCode::Down | KeyCode::Right => self.focus = Focus::next(self, false),
@@ -401,7 +381,6 @@ impl App {
             }
             MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
                 if self.confirm.is_some() && self.contains(self.modal_rect(), point) {
-                    // inside the modal: focus the button under the click
                     for (f, r) in self.hit.iter() {
                         if matches!(f, Focus::ModalOk | Focus::ModalCancel)
                             && self.contains(*r, point)
@@ -469,7 +448,6 @@ impl App {
         self.quit = true;
     }
 
-    /// Focus + activate a control.
     fn activate(&mut self, focus: Focus) {
         match focus {
             Focus::Model(i) if self.screen == Screen::ModelSelect => {
@@ -496,8 +474,6 @@ impl App {
                 }
             }
             Focus::Restore => {
-                // any existing capture: the full restore writes the
-                // intact images and the modal lists what is skipped
                 if self.busy == Busy::None && !self.done && self.backup.dir().is_some() {
                     self.busy = Busy::Restore;
                     self.notice = None;
@@ -658,7 +634,6 @@ mod tests {
         }
     }
 
-    /// An app whose fake column always reports a Capsule identity.
     fn app() -> App {
         App::new(Session::spawn(
             vec![Box::new(FakeBackend {

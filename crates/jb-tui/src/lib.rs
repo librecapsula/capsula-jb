@@ -1,13 +1,9 @@
-//! capsula-jb — the terminal UI. Opens when the tool is launched
-//! without a single argument (the branch in jb-cli/src/main.rs) on
-//! every platform: unlike the CLI it drives the same
-//! [`jb_core::session::Session`] worker — connect (the model select
-//! screen is instructions, the session itself accepts either model
-//! and the screen switches on the identity) → the working screen with
-//! the backup pane, the jailbreak settings, the log, the progress and
-//! the flash button. Everything is operable from the keyboard (Tab,
-//! arrows, Enter/Space, Esc/q) and the mouse (click = focus +
-//! activate, the wheel scrolls the log).
+//! capsula-jb — the terminal UI: opens when the tool is launched
+//! without a single argument in an interactive terminal (the branch in
+//! jb-cli/src/main.rs). Drives the same
+//! [`jb_core::session::Session`] worker as the CLI; the model select
+//! screen is instructions only — the session accepts either model and
+//! switches on the connected identity.
 //!
 //! The log pane is fed by the `log` facade (see [`logger`]) — domain
 //! crates keep logging as usual.
@@ -34,11 +30,8 @@ use std::time::Duration;
 /// without input.
 const TICK: Duration = Duration::from_millis(50);
 
-/// Launch the UI over the given backends; returns when the user quits
-/// (the last window closes — this IS the tool's face).
+/// Launch the UI over the given backends; returns when the user quits.
 pub fn run(backends: Vec<Box<dyn Backend>>) -> Result<()> {
-    // The log bridge first: everything the worker logs must land in
-    // the pane.
     let (log_tx, log_rx) = mpsc::channel::<String>();
     logger::install(log_tx);
 
@@ -99,8 +92,8 @@ fn restore_terminal() {
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
-/// The connection instructions of a model (screen 1/2), from the
-/// embedded config — the same texts the CLI prints as wait hints.
+/// The connection instructions of a model, from the embedded config —
+/// the same texts the CLI prints as wait hints.
 pub(crate) fn hint_text(model: jb_core::session::Model) -> String {
     let config = jb_core::config::Config::embedded();
     match model {

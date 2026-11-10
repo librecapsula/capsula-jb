@@ -2,11 +2,6 @@
 //! userdata-overlay / monitor. The data partition is not signed and is
 //! freely rewritable — the overlay with adbd goes into it, everything
 //! else stays untouched.
-//!
-//! main — the entry point: argument parsing, platform selection by the
-//! USB device on the bus (jb-cli/src/backend.rs) and the confirmation
-//! prompt. The scenario skeleton lives in jb-core (`scenario`), the
-//! platform implementations in the jb-rockchip / jb-amlogic crates.
 
 mod backend;
 mod logging;
@@ -94,10 +89,9 @@ fn main() -> anyhow::Result<()> {
     // No arguments at all AND an interactive terminal — the TUI (every
     // platform). Any argument, even a bare global flag, keeps the CLI
     // path below; a piped/redirected stdio (agents, CI) also falls
-    // through to the CLI — the TUI is for humans only, and the CLI
-    // confirm flow is the agent-facing contract. The TUI installs its
-    // own log bridge (the pane IS the log), so the CLI logger must not
-    // be initialized on this branch; quitting the TUI ends the process.
+    // through — the CLI confirm flow is the agent-facing contract. The
+    // TUI installs its own log bridge, so the CLI logger must not be
+    // initialized on this branch.
     if std::env::args_os().nth(1).is_none() && interactive_terminal() {
         // An elevated relaunch (Windows UAC manifest) may start in
         // C:\Windows\System32; the tool writes backup/work relative to
@@ -113,8 +107,8 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    // The logger comes first: all tool output (including the final
-    // error) goes through it, with millisecond timestamps.
+    // The logger comes first: all output, including the final error,
+    // goes through it.
     logging::init();
     if let Some(cwd) = win_drv::fix_cwd_if_system32() {
         log::info!("рабочий каталог: {}", cwd.display());
@@ -155,15 +149,12 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
     // The offline commands do not wait for a device and do not build a
     // driver session.
     match &cli.command {
-        // The live bus log.
         Some(Command::Monitor) => return monitor_bus(),
         Some(Command::Backups { verify }) => return list_backups(*verify),
         Some(Command::BackupDelete { model, key }) => return delete_backup(model, key, cli.yes),
         _ => {}
     }
     let session = Session::spawn(backend::backends(), wait);
-    // The command is known upfront; queue it — the worker serves it
-    // once a device connects.
     session.command(match &cli.command {
         None => SessionCommand::Jailbreak(Params {
             format_userdata: cli.format_userdata,

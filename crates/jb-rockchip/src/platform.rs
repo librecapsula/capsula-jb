@@ -48,8 +48,7 @@ struct Device {
     /// The session is our usbplug in RAM (readable above the stock
     /// mask) — as opposed to the stock loader persona.
     usbplug: bool,
-    /// A fresh backup was taken this run (false = a verified backup for
-    /// this serial already existed, or --no-backup).
+    /// A fresh backup was taken this run.
     dumped: bool,
 }
 
@@ -680,11 +679,8 @@ impl Rockchip {
     }
 }
 
-/// The verified dump of this column (regular path), re-verified before
-/// it becomes the base of the only copy.
-/// The verified v2 backup of this column as the patch base (the
-/// userdata image), re-verified before it becomes the base of the only
-/// copy.
+/// The verified v2 backup of this column as the patch base, re-verified
+/// before it becomes the base of the only copy.
 fn image_base(dir: &Path) -> Result<Option<PathBuf>> {
     let entry = catalog::read(dir).ok_or_else(|| {
         anyhow!("нет валидного бэкапа этой колонки — запустите инструмент ещё раз")

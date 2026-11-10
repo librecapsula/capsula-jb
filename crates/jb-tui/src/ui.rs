@@ -51,7 +51,6 @@ fn status_line_rect(area: Rect) -> Rect {
     }
 }
 
-/// 1: the model radio + the connection instructions of the selection.
 fn render_model_select(f: &mut Frame, app: &mut App) {
     let [list, hint] =
         Layout::vertical([Constraint::Length(6), Constraint::Min(1)]).areas(f.area());
@@ -120,7 +119,7 @@ fn render_model_select(f: &mut Frame, app: &mut App) {
     );
 }
 
-/// 2: the instructions again + the live log tail (bring-up steps).
+/// The instructions again + the live log tail (bring-up steps).
 fn render_waiting(f: &mut Frame, app: &mut App) {
     let [hint, log] =
         Layout::vertical([Constraint::Length(14), Constraint::Min(3)]).areas(f.area());
@@ -139,7 +138,6 @@ fn render_waiting(f: &mut Frame, app: &mut App) {
     log_pane(f, app, log);
 }
 
-/// 3: the working screen.
 fn render_main(f: &mut Frame, app: &mut App) {
     let [top, settings, log, bottom] = Layout::vertical([
         Constraint::Length(8),
@@ -149,13 +147,13 @@ fn render_main(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
 
-    // 3.2: the column (left) and its backups (right)
+    // the column (left) and its backups (right)
     let [info, backups] =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(top);
     render_info(f, app, info);
     render_backups(f, app, backups);
 
-    // 3.3: the settings
+    // the settings
     let cols = Layout::horizontal([
         Constraint::Percentage(34),
         Constraint::Percentage(33),
@@ -187,7 +185,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
         app.settings.no_backup,
     );
 
-    // 3.4: the log, then the progress + the flash button
+    // the log, then the progress + the flash button
     log_pane(f, app, log);
     let [progress_area, button_area] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(16)]).areas(bottom);
@@ -398,7 +396,6 @@ fn button(f: &mut Frame, app: &mut App, area: Rect, focus: Focus, text: &str, en
     );
 }
 
-/// A settings checkbox line.
 fn checkbox(f: &mut Frame, app: &mut App, area: Rect, focus: Focus, label: &str, checked: bool) {
     let inner = Rect {
         x: area.x + 1,
@@ -424,8 +421,6 @@ fn checkbox(f: &mut Frame, app: &mut App, area: Rect, focus: Focus, label: &str,
     f.render_widget(Block::default().borders(Borders::ALL), area);
 }
 
-/// The modal: a write confirmation (with the plan) or a delete
-/// confirmation.
 fn render_modal(f: &mut Frame, app: &mut App) {
     let area = centered_rect(f.area(), 64, 14);
     f.render_widget(Clear, area);

@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 /// The manifest file name inside a backup directory.
 pub const MANIFEST: &str = "backup.json";
 
-/// The v2 format number.
 pub const FORMAT: u32 = 2;
 
 /// The overall capture state.
@@ -116,7 +115,7 @@ impl BackupEntry {
             .sum()
     }
 
-    /// Delete the whole backup directory (the TUI's "delete backup").
+    /// Delete the whole backup directory.
     pub fn delete(self) -> std::io::Result<()> {
         std::fs::remove_dir_all(self.dir)
     }

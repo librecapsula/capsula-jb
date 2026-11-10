@@ -3,11 +3,11 @@
 //! every UI (the CLI loop, the TUI) talks over. Logs keep flowing
 //! through the `log` facade — each UI installs its own sink.
 //!
-//! The worker absorbs the old `pick_backend` loop: it waits for a
-//! device of any known platform, connects it (identity event), reports
-//! the local backup state and then serves [`Command`]s one at a time.
-//! A confirmation requested mid-operation blocks the worker until the
-//! UI answers (or its end of the channel closes — that aborts).
+//! The worker waits for a device of any known platform, connects it
+//! (identity event), reports the local backup state and then serves
+//! [`Command`]s one at a time. A confirmation requested mid-operation
+//! blocks the worker until the UI answers (or its end of the channel
+//! closes — that aborts).
 
 use crate::backend::Backend;
 use crate::progress::Progress;
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// download window is ~450 ms; the rockchip monitor polls at 50 ms).
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The supported speaker models (the TUI's first screen).
+/// The supported speaker models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Model {
@@ -32,7 +32,6 @@ pub enum Model {
 }
 
 impl Model {
-    /// The human name shown in UIs.
     pub fn label(&self) -> &'static str {
         match self {
             Model::Capsule => "Капсула",
@@ -51,7 +50,6 @@ impl Model {
     }
 }
 
-/// The connected column, as [`Backend::connect`] identifies it.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub model: Model,
@@ -62,7 +60,7 @@ pub struct Identity {
     /// (0xCC above the 32 MiB read mask), userdata is always built
     /// from scratch.
     pub firstgen: bool,
-    /// Platform caveats to show next to the identity (may be empty).
+    /// Platform caveats to show next to the identity.
     pub caveats: Vec<String>,
 }
 
@@ -75,7 +73,6 @@ pub enum Command {
     Restore,
 }
 
-/// The UI's answer to [`Event::ConfirmRequested`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Proceed,
@@ -91,15 +88,13 @@ pub enum Event {
         hints: Vec<String>,
     },
     /// A device connected and identified.
-    DeviceConnected {
-        identity: Identity,
-    },
+    DeviceConnected { identity: Identity },
     /// The connected column's backup situation (also re-emitted after
     /// every finished operation — a backup may have appeared).
     BackupState(BackupState),
     Progress(Progress),
     /// The scenario is about to write and needs a decision. The worker
-    /// is BLOCKED until `reply` anwers; dropping the sender aborts.
+    /// is BLOCKED until `reply` answers; dropping the sender aborts.
     ConfirmRequested {
         plan: WritePlan,
         reply: Sender<Decision>,
@@ -132,8 +127,7 @@ impl Session {
         }
     }
 
-    /// Queue a command (served after a device is connected, one at a
-    /// time). Ignored if the worker is gone.
+    /// Queue a command; ignored if the worker is gone.
     pub fn command(&self, cmd: Command) {
         let _ = self.cmd.send(cmd);
     }
@@ -145,8 +139,6 @@ impl Session {
     }
 }
 
-/// The worker: wait for a device → connect → report identity and
-/// backup state → serve commands until the handle drops.
 fn worker(
     backends: Vec<Box<dyn Backend>>,
     wait: Option<Duration>,
@@ -193,9 +185,8 @@ fn worker(
     }
 }
 
-/// The old CLI `pick_backend` loop: poll every backend's presence,
-/// connect the first one that shows up. Emits [`Event::WaitingForDevice`]
-/// once while the bus is empty.
+/// Poll every backend's presence, connect the first one that shows up.
+/// Emits [`Event::WaitingForDevice`] once while the bus is empty.
 fn wait_for_backend(
     mut backends: Vec<Box<dyn Backend>>,
     wait: Option<Duration>,
@@ -255,7 +246,6 @@ mod tests {
         polls: RefCell<u32>,
         calls: RefCell<Vec<&'static str>>,
         identity: Identity,
-        /// What ensure_backup returns as the base.
         base: Option<PathBuf>,
     }
 

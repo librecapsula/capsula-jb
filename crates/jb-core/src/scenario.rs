@@ -46,7 +46,6 @@ impl Default for Params {
 /// the only copy.
 #[derive(Debug, Clone)]
 pub enum BackupState {
-    /// No capture directory for this column at all.
     None,
     /// A capture that opened and passed the checksum verification —
     /// usable as the patch base and for restore.
@@ -64,8 +63,7 @@ pub struct Prepared {
     /// None = build from scratch (no capture, a capture that cannot
     /// serve as a base, or --no-backup).
     pub base: Option<PathBuf>,
-    /// A new capture was taken this run (false = a verified capture for
-    /// this column already existed, or none was taken).
+    /// A new capture was taken this run.
     pub dumped: bool,
     /// The capture directory, for the backup-only report. None when no
     /// capture was considered (--no-backup).
@@ -93,7 +91,7 @@ pub struct WritePlan {
     /// --no-backup run.
     pub no_backup: bool,
     /// The plan restores the verified capture instead of writing a
-    /// patched image (the confirm line says "восстановление").
+    /// patched image.
     pub restore: bool,
     /// The full human description of the write mode.
     pub mode: String,
@@ -104,10 +102,9 @@ pub struct WritePlan {
 /// --yes is given.
 pub type Confirm<'a> = &'a dyn Fn(&WritePlan) -> Result<()>;
 
-/// The device-specific steps of the scenario, implemented by the CLI
-/// backends over their transports. Every hook may talk to the device
-/// (and, on amlogic, go through reconnect windows) — the skeleton only
-/// fixes the order. The device is already connected
+/// The device-specific steps of the scenario: every hook may talk to
+/// the device (on amlogic, through reconnect windows) — the skeleton
+/// only fixes the order. The device is already connected
 /// ([`crate::backend::Backend::connect`]) when the hooks run.
 pub trait Platform {
     /// Settle the backup: capture it (a checkpoint loop where the
@@ -124,15 +121,12 @@ pub trait Platform {
     /// must be built to).
     fn data_size(&mut self, progress: ProgressFn) -> Result<u64>;
 
-    /// The partition name as the platform calls it (userdata on
-    /// rockchip, data on amlogic) — for the confirmation line.
+    /// The partition name as the platform calls it, for the
+    /// confirmation line.
     fn data_partition(&self) -> &'static str;
 
-    /// The write-mode description for the confirmation line.
     fn describe_write(&self, fresh: bool, no_backup: bool) -> String;
 
-    /// The restore-mode description (writing the verified capture back
-    /// over the current content) for the confirmation line.
     fn describe_restore(&self) -> String;
 
     /// Build the data partition image with the overlay files: EXACTLY
@@ -147,9 +141,8 @@ pub trait Platform {
         progress: ProgressFn,
     ) -> Result<()>;
 
-    /// Write the image built by [`Self::build_data_image`] to the
-    /// device. The image is exactly the partition size; nothing is
-    /// read back afterwards.
+    /// Write the built image to the device; nothing is read back
+    /// afterwards.
     fn write_data_image(&mut self, image: &std::path::Path, progress: ProgressFn) -> Result<()>;
 
     /// The full-restore set of the connected column: every INTACT
@@ -174,7 +167,6 @@ pub trait Platform {
     fn report_backup(&self, prepared: &Prepared);
 }
 
-/// One image of a full restore.
 #[derive(Debug, Clone)]
 pub struct RestoreItem {
     pub partition: String,
