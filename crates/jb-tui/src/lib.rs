@@ -1,9 +1,9 @@
 //! capsula-jb — the terminal UI: opens when the tool is launched
 //! without a single argument in an interactive terminal (the branch in
-//! jb-cli/src/main.rs). Drives the same
-//! [`jb_core::session::Session`] worker as the CLI; the model select
-//! screen is instructions only — the session accepts either model and
-//! switches on the connected identity.
+//! jb-cli/src/main.rs). The model menu comes first; the session worker
+//! starts only when the model is committed (it polls exactly that
+//! model's backend) and the waiting screen then shows the connection
+//! instructions. Changing the model = restarting the tool.
 //!
 //! The log pane is fed by the `log` facade (see [`logger`]) — domain
 //! crates keep logging as usual.
@@ -14,7 +14,7 @@ mod ui;
 
 use anyhow::Result;
 use jb_core::backend::Backend;
-use jb_core::session::Session;
+use jb_core::session::Model;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEventKind,
@@ -30,13 +30,13 @@ use std::time::Duration;
 /// without input.
 const TICK: Duration = Duration::from_millis(50);
 
-/// Launch the UI over the given backends; returns when the user quits.
-pub fn run(backends: Vec<Box<dyn Backend>>) -> Result<()> {
+/// Launch the UI; `for_model` is the binary's platform dispatch (see
+/// jb-cli's `backend`). Returns when the user quits.
+pub fn run(for_model: fn(Model) -> Box<dyn Backend>) -> Result<()> {
     let (log_tx, log_rx) = mpsc::channel::<String>();
     logger::install(log_tx);
 
-    let session = Session::spawn(backends, None);
-    let mut app = app::App::new(session);
+    let mut app = app::App::new(for_model);
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -65,10 +65,9 @@ fn event_loop(
 ) -> Result<()> {
     loop {
         // worker events first: a confirm must be answerable before the
-        // next input poll blocks for the tick
-        while let Ok(ev) = app.session.events().try_recv() {
-            app.on_session_event(ev);
-        }
+        // next input poll blocks for the tick (a no-op before the
+        // model commit — there is no worker yet)
+        app.poll_events();
         while let Ok(line) = log_rx.try_recv() {
             app.push_log(line);
         }
@@ -98,6 +97,8 @@ pub(crate) fn hint_text(model: jb_core::session::Model) -> String {
     let config = jb_core::config::Config::embedded();
     match model {
         jb_core::session::Model::Capsula => config.hint.capsula_connect_text.clone(),
-        jb_core::session::Model::CapsulaMiniAmlogic => config.hint.capsula_mini_amlogic_connect_text.clone(),
+        jb_core::session::Model::CapsulaMiniAmlogic => {
+            config.hint.capsula_mini_amlogic_connect_text.clone()
+        }
     }
 }

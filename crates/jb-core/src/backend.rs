@@ -1,9 +1,9 @@
 //! The platform contract. The session worker (jb-core `session`, used
-//! by both the CLI and the TUI) picks a backend by the USB device that
-//! appears on the bus (platforms differ by VID:PID), connects it and
-//! runs the scenario through the [`Platform`] hooks of the same object.
+//! by both the CLI and the TUI) connects the backend of the model the
+//! user chose up front (the CLI `--model` flag, the TUI menu) and runs
+//! the scenario through the [`Platform`] hooks of the same object.
 //! A new platform = a new `jb-<name>` crate implementing both traits
-//! plus one line in the binary's `backends()`.
+//! plus an arm in the binary's platform dispatch (`for_model`).
 
 use crate::progress::ProgressFn;
 use crate::session::Identity;

@@ -34,8 +34,8 @@ pub enum Model {
 impl Model {
     pub fn label(&self) -> &'static str {
         match self {
-            Model::Capsula => "Капсула",
-            Model::CapsulaMiniAmlogic => "Капсула Мини",
+            Model::Capsula => "Капсула (Большая)",
+            Model::CapsulaMiniAmlogic => "Капсула Мини (Amlogic)",
         }
     }
 
@@ -44,8 +44,19 @@ impl Model {
     /// platforms may collide, so the layout is per-model.
     pub fn dir_name(&self) -> &'static str {
         match self {
-            Model::Capsula => "capsule",
-            Model::CapsulaMiniAmlogic => "capsule-mini",
+            Model::Capsula => "capsula",
+            Model::CapsulaMiniAmlogic => "capsula-mini-amlogic",
+        }
+    }
+
+    /// Parse the canonical model name — the CLI `--model` value, the
+    /// `backup-delete` argument and the backup layout segment all use
+    /// the same vocabulary: capsula | capsula-mini-amlogic.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "capsula" => Some(Model::Capsula),
+            "capsula-mini-amlogic" => Some(Model::CapsulaMiniAmlogic),
+            _ => None,
         }
     }
 }

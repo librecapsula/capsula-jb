@@ -2,12 +2,12 @@
 //! control activation.
 
 use super::{App, BackupSnapshot, Busy, Confirm, Screen};
+use jb_core::session::Session;
 
 /// A focusable control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Focus {
     Model(usize),
-    ModelNext,
     TakeBackup,
     Restore,
     DeleteBackup,
@@ -22,7 +22,7 @@ pub enum Focus {
 impl Focus {
     /// The focus cycle order of the current screen.
     fn ring(app: &App) -> &'static [Focus] {
-        const MODEL: &[Focus] = &[Focus::Model(0), Focus::Model(1), Focus::ModelNext];
+        const MODEL: &[Focus] = &[Focus::Model(0), Focus::Model(1)];
         const MAIN: &[Focus] = &[
             Focus::TakeBackup,
             Focus::Restore,
@@ -163,11 +163,9 @@ impl App {
     fn escape(&mut self) {
         match self.screen {
             Screen::ModelSelect => self.quit = true,
-            Screen::Waiting => {
-                self.screen = Screen::ModelSelect;
-                self.focus = Focus::Model(0);
-            }
-            Screen::Main => self.request_quit(),
+            // Changing the model = a full restart of the tool; the
+            // waiting screen only exits.
+            Screen::Waiting | Screen::Main => self.request_quit(),
         }
     }
 
@@ -194,11 +192,13 @@ impl App {
                 } else {
                     jb_core::session::Model::CapsulaMiniAmlogic
                 };
-            }
-            Focus::ModelNext => {
-                self.screen = Screen::Waiting;
-                self.hints = vec![crate::hint_text(self.selected_model).to_string()];
-                self.focus = Focus::ModelNext;
+                // The worker starts here — the chosen model gates the
+                // platform, its backend is the only one polled.
+                self.session = Some(Session::spawn(
+                    vec![(self.for_model)(self.selected_model)],
+                    None,
+                ));
+                self.go_waiting();
             }
             Focus::SetAdbd => self.settings.adbd = !self.settings.adbd,
             Focus::SetFormat => self.settings.format_userdata = !self.settings.format_userdata,
@@ -208,7 +208,7 @@ impl App {
                     self.busy = Busy::Backup;
                     self.notice = None;
                     self.error = None;
-                    self.session.command(jb_core::session::Command::Backup);
+                    self.session().command(jb_core::session::Command::Backup);
                 }
             }
             Focus::Restore => {
@@ -216,7 +216,7 @@ impl App {
                     self.busy = Busy::Restore;
                     self.notice = None;
                     self.error = None;
-                    self.session.command(jb_core::session::Command::Restore);
+                    self.session().command(jb_core::session::Command::Restore);
                 }
             }
             Focus::DeleteBackup => {
@@ -234,7 +234,7 @@ impl App {
                     self.busy = Busy::Jailbreak;
                     self.notice = None;
                     self.error = None;
-                    self.session
+                    self.session()
                         .command(jb_core::session::Command::Jailbreak(self.settings.params()));
                 }
             }
@@ -260,6 +260,15 @@ impl App {
             Focus::ModalCancel => self.cancel_confirm(),
             Focus::Model(_) => {}
         }
+    }
+
+    /// Move to the waiting screen and show the connection
+    /// instructions of the selected model. The focus stays on a model
+    /// row — inert there (activation is guarded by ModelSelect), Tab
+    /// walks into the main ring.
+    fn go_waiting(&mut self) {
+        self.screen = Screen::Waiting;
+        self.hints = vec![crate::hint_text(self.selected_model).to_string()];
     }
 
     /// Answer the write confirm with Abort (or just drop a local

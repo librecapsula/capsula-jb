@@ -1,5 +1,5 @@
-//! Screen 2: the instructions again + the live log tail (bring-up
-//! steps).
+//! Screen 2: the connection instructions of the chosen model + the
+//! live log tail (bring-up steps).
 
 use super::log_pane;
 use crate::app::App;

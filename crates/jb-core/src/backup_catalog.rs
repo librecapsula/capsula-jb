@@ -297,7 +297,10 @@ mod tests {
     fn scan_lists_entries_and_open_finds_by_model_and_key() {
         let root = tmp("scan");
         // same key under two models — no collision
-        for (model, file) in [(Model::Capsula, "a.img"), (Model::CapsulaMiniAmlogic, "a.bin")] {
+        for (model, file) in [
+            (Model::Capsula, "a.img"),
+            (Model::CapsulaMiniAmlogic, "a.bin"),
+        ] {
             let dir = root.join(model.dir_name()).join("SAMEKEY");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(file), b"x").unwrap();

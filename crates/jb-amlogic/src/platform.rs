@@ -303,7 +303,11 @@ impl Platform for Amlogic {
         // The v2 manifest metadata first (no hashing here — the
         // checksum pass runs in ensure_backup); unfinished directories
         // are surfaced through the schema-2 checkpoint status.
-        match jb_core::backup_catalog::open(Path::new("backup"), Model::CapsulaMiniAmlogic, &deviceid) {
+        match jb_core::backup_catalog::open(
+            Path::new("backup"),
+            Model::CapsulaMiniAmlogic,
+            &deviceid,
+        ) {
             Some(e) if e.manifest.status == jb_core::backup_catalog::Status::Complete => {
                 BackupState::Verified { dir: e.dir }
             }
@@ -398,15 +402,18 @@ impl Platform for Amlogic {
             .clone()
             .ok_or_else(|| anyhow!("устройство не подключено"))?;
         let deviceid = capture::device_id(&env_raw)?;
-        let entry =
-            jb_core::backup_catalog::open(Path::new("backup"), Model::CapsulaMiniAmlogic, &deviceid)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "восстановление невозможно: нет верифицированного захвата {} \
+        let entry = jb_core::backup_catalog::open(
+            Path::new("backup"),
+            Model::CapsulaMiniAmlogic,
+            &deviceid,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "восстановление невозможно: нет верифицированного захвата {} \
                      для этой колонки; сначала снимите его — capsula-jb backup",
-                        deviceid
-                    )
-                })?;
+                deviceid
+            )
+        })?;
         entry
             .verify()
             .context("захват не прошёл проверку SHA256 — снимите его заново")?;

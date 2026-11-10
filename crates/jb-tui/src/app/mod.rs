@@ -1,7 +1,9 @@
 //! The TUI application state: the screen machine (model select →
-//! waiting → main) and the session-event handling. Plain data +
-//! methods, testable without a terminal; the input routing lives in
-//! [`input`], the tests in [`tests`].
+//! waiting → main) and the session-event handling. The session worker
+//! starts only when the model is committed — it polls exactly that
+//! model's backend. Plain data + methods, testable without a
+//! terminal; the input routing lives in [`input`], the tests in
+//! [`tests`].
 
 pub mod input;
 #[cfg(test)]
@@ -9,6 +11,7 @@ mod tests;
 
 pub use input::Focus;
 
+use jb_core::backend::Backend;
 use jb_core::progress::Progress;
 use jb_core::scenario::WritePlan;
 use jb_core::session::{Event, Identity, Model, Session};
@@ -106,7 +109,11 @@ pub enum Confirm {
 }
 
 pub struct App {
-    pub session: Session,
+    /// The backend factory of the binary (jb-cli's platform dispatch).
+    pub for_model: fn(Model) -> Box<dyn Backend>,
+    /// The session worker, spawned at the model commit — `None`
+    /// while the model menu is up.
+    pub session: Option<Session>,
     pub screen: Screen,
     pub quit: bool,
 
@@ -139,9 +146,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: Session) -> Self {
+    pub fn new(for_model: fn(Model) -> Box<dyn Backend>) -> Self {
         App {
-            session,
+            for_model,
+            session: None,
             screen: Screen::ModelSelect,
             quit: false,
             selected_model: Model::Capsula,
@@ -163,6 +171,29 @@ impl App {
         }
     }
 
+    /// The live session; commands are only reachable past the model
+    /// menu, where the worker already exists.
+    pub(crate) fn session(&self) -> &Session {
+        self.session
+            .as_ref()
+            .expect("команда без запущенной сессии")
+    }
+
+    /// Drain the pending worker events of this tick into the state
+    /// machine.
+    pub fn poll_events(&mut self) {
+        loop {
+            let ev = match self.session.as_ref() {
+                Some(s) => s.events().try_recv(),
+                None => return,
+            };
+            match ev {
+                Ok(ev) => self.on_session_event(ev),
+                Err(_) => return,
+            }
+        }
+    }
+
     pub fn push_log(&mut self, line: impl Into<String>) {
         if self.logs.len() == LOG_CAP {
             self.logs.pop_front();
@@ -178,14 +209,9 @@ impl App {
                 }
             }
             Event::DeviceConnected { identity } => {
-                if identity.model != self.selected_model {
-                    self.notice = Some(format!(
-                        "на шине {} ({}) — переключаюсь",
-                        identity.model.label(),
-                        identity.key
-                    ));
-                }
-                self.selected_model = identity.model;
+                // The worker polls only the chosen model's backend, so
+                // the identity is that model by construction — no
+                // switching.
                 self.identity = Some(identity);
                 self.screen = Screen::Main;
                 self.focus = Focus::TakeBackup;

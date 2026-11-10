@@ -1700,7 +1700,10 @@ mod tests {
         // the real capture_pass publishes v2 at its finalize step; the
         // test harness bypasses it, so publish explicitly here
         let entry = publish_v2(&dir).unwrap().expect("v2 entry");
-        assert_eq!(entry.manifest.model, jb_core::session::Model::CapsulaMiniAmlogic);
+        assert_eq!(
+            entry.manifest.model,
+            jb_core::session::Model::CapsulaMiniAmlogic
+        );
         assert_eq!(entry.manifest.status, catalog::Status::Complete);
         assert_eq!(
             entry.manifest.key,

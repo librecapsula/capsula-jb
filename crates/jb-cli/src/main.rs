@@ -12,7 +12,6 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 
 use jb_core::format::humansize;
-use jb_core::progress::Progress;
 use jb_core::scenario::{Params, WritePlan};
 use jb_core::session::{Command as SessionCommand, Decision, Event, Session};
 use std::time::Duration;
@@ -24,6 +23,11 @@ use std::time::Duration;
     about = "Джейлбрейк VK Capsula: дамп → оверлей adbd в userdata → ADB"
 )]
 struct Cli {
+    /// The speaker model this run targets (capsula |
+    /// capsula-mini-amlogic); required by the device commands
+    #[arg(long, value_name = "MODEL", global = true)]
+    model: Option<String>,
+
     /// How many seconds to wait for the speaker on USB (0 = forever)
     #[arg(long, value_name = "SEC", default_value = "0", global = true)]
     wait: u64,
@@ -69,20 +73,13 @@ enum Command {
     /// (the TUI's "delete backup" button)
     #[command(name = "backup-delete")]
     BackupDelete {
-        /// The model: capsule | capsula-mini
+        /// The model: capsula | capsula-mini-amlogic
         model: String,
-        /// The column key: the serial (capsule) or the deviceid (capsula-mini)
+        /// The column key: the serial (capsula) or the deviceid (capsula-mini-amlogic)
         key: String,
     },
     /// Live log of USB events
     Monitor,
-    /// Amlogic Mini: identify the board and pass through u-boot burning
-    /// commands (diagnostics; example: capsula-jb aml "printenv bootdelay")
-    Aml {
-        /// Commands one by one; with no commands — identify only
-        #[arg(value_name = "CMD")]
-        cmds: Vec<String>,
-    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -99,7 +96,7 @@ fn main() -> anyhow::Result<()> {
         // log line is not shown: the bridge is installed inside
         // jb_tui::run, after this point.)
         let _ = win_drv::fix_cwd_if_system32();
-        if let Err(e) = jb_tui::run(backend::backends()) {
+        if let Err(e) = jb_tui::run(backend::for_model) {
             // the TUI is torn down; the detached log bridge prints
             // this with a timestamp
             log::error!("{e:?}");
@@ -154,7 +151,15 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
         Some(Command::BackupDelete { model, key }) => return delete_backup(model, key, cli.yes),
         _ => {}
     }
-    let session = Session::spawn(backend::backends(), wait);
+    // The model comes first: the session worker polls only its backend,
+    // so a device of the other platform on the bus is not even seen.
+    let model = match cli.model.as_deref() {
+        Some(name) => jb_core::session::Model::from_name(name).ok_or_else(|| {
+            anyhow::anyhow!("неизвестная модель {name:?} (capsula | capsula-mini-amlogic)")
+        })?,
+        None => bail!("укажите модель: --model capsula | capsula-mini-amlogic"),
+    };
+    let session = Session::spawn(vec![backend::for_model(model)], wait);
     session.command(match &cli.command {
         None => SessionCommand::Jailbreak(Params {
             format_userdata: cli.format_userdata,
@@ -173,14 +178,11 @@ fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
             }
             SessionCommand::Restore
         }
-        // Handled above (the offline commands return before the session).
+        // Handled above (the offline commands return before the
+        // session).
         Some(Command::Monitor) => unreachable!("monitor handled above"),
         Some(Command::Backups { .. }) | Some(Command::BackupDelete { .. }) => {
             unreachable!("offline commands handled above")
-        }
-        // Passthrough is Amlogic Mini diagnostics, outside the session.
-        Some(Command::Aml { cmds }) => {
-            return jb_amlogic::diag::passthrough(wait, cmds, &|ev: Progress| p.handle(ev));
         }
     });
     // A refused confirmation with its own actionable error (the
@@ -347,11 +349,9 @@ fn list_backups(verify: bool) -> anyhow::Result<()> {
 /// rules: interactive [y/N], non-interactive (agents) refuses and
 /// points at --yes.
 fn delete_backup(model: &str, key: &str, yes: bool) -> anyhow::Result<()> {
-    let model = match model {
-        "capsule" => jb_core::session::Model::Capsula,
-        "capsula-mini" => jb_core::session::Model::CapsulaMiniAmlogic,
-        other => bail!("неизвестная модель {other:?} (capsule | capsula-mini)"),
-    };
+    let model = jb_core::session::Model::from_name(model).ok_or_else(|| {
+        anyhow::anyhow!("неизвестная модель {model:?} (capsula | capsula-mini-amlogic)")
+    })?;
     let Some(entry) = jb_core::backup_catalog::open(std::path::Path::new("backup"), model, key)
     else {
         bail!("бэкап не найден: backup/{}/{key}", model.dir_name());

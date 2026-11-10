@@ -3,91 +3,43 @@
 
 use super::render;
 use crate::app::{App, Busy, Focus, Screen};
-use jb_core::session::{Identity, Model, Session};
+use jb_core::backend::Backend;
+use jb_core::session::{Identity, Model};
+
+/// A backend that is never present: the session worker of the tests
+/// polls quietly and never connects (the click tests drive the state
+/// machine by hand).
+struct NoBackend;
+impl jb_core::backend::Backend for NoBackend {
+    fn name(&self) -> &'static str {
+        "none"
+    }
+    fn present(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn connect(
+        &mut self,
+        _w: Option<std::time::Duration>,
+        _p: jb_core::progress::ProgressFn,
+    ) -> anyhow::Result<jb_core::session::Identity> {
+        unreachable!()
+    }
+    fn platform(&mut self) -> &mut dyn jb_core::scenario::Platform {
+        unreachable!()
+    }
+}
+
+fn noop_for_model(_: Model) -> Box<dyn Backend> {
+    Box::new(NoBackend)
+}
 
 fn app() -> App {
-    // no worker needed for render tests: events are never drained
-    struct NoBackend;
-    impl jb_core::backend::Backend for NoBackend {
-        fn name(&self) -> &'static str {
-            "none"
-        }
-        fn present(&self) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        fn connect(
-            &mut self,
-            _w: Option<std::time::Duration>,
-            _p: jb_core::progress::ProgressFn,
-        ) -> anyhow::Result<Identity> {
-            unreachable!()
-        }
-        fn platform(&mut self) -> &mut dyn jb_core::scenario::Platform {
-            unreachable!()
-        }
-    }
-    impl jb_core::scenario::Platform for NoBackend {
-        fn ensure_backup(
-            &mut self,
-            _n: bool,
-            _p: jb_core::progress::ProgressFn,
-        ) -> anyhow::Result<jb_core::scenario::Prepared> {
-            unreachable!()
-        }
-        fn backup_state(&self) -> jb_core::scenario::BackupState {
-            jb_core::scenario::BackupState::None
-        }
-        fn data_size(&mut self, _p: jb_core::progress::ProgressFn) -> anyhow::Result<u64> {
-            unreachable!()
-        }
-        fn data_partition(&self) -> &'static str {
-            ""
-        }
-        fn describe_write(&self, _f: bool, _n: bool) -> String {
-            String::new()
-        }
-        fn describe_restore(&self) -> String {
-            String::new()
-        }
-        fn build_data_image(
-            &self,
-            _b: Option<&std::path::Path>,
-            _o: &std::path::Path,
-            _s: u64,
-            _f: &[jb_core::overlay::OverlayFile],
-            _p: jb_core::progress::ProgressFn,
-        ) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn write_data_image(
-            &mut self,
-            _i: &std::path::Path,
-            _p: jb_core::progress::ProgressFn,
-        ) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn restore_set(
-            &mut self,
-        ) -> anyhow::Result<(Vec<jb_core::scenario::RestoreItem>, Vec<String>)> {
-            unreachable!()
-        }
-        fn write_restore(
-            &mut self,
-            _items: &[jb_core::scenario::RestoreItem],
-            _p: jb_core::progress::ProgressFn,
-        ) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn finish(&mut self, _p: jb_core::progress::ProgressFn) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn report_backup(&self, _p: &jb_core::scenario::Prepared) {}
-    }
-    App::new(Session::spawn(vec![Box::new(NoBackend)], None))
+    App::new(noop_for_model)
 }
 
 fn main_screen_app() -> App {
     let mut a = app();
+    a.activate(Focus::Model(0)); // spawn the idle worker
     a.screen = Screen::Main;
     a.identity = Some(Identity {
         model: Model::Capsula,
@@ -104,10 +56,9 @@ fn hit_rects_cover_the_focusable_controls() {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &mut a)).unwrap();
-    // model select: two model rows + the next button
+    // model select: the two menu rows
     assert!(a.hit.contains_key(&Focus::Model(0)));
     assert!(a.hit.contains_key(&Focus::Model(1)));
-    assert!(a.hit.contains_key(&Focus::ModelNext));
 
     // the main screen: buttons + checkboxes + the flash button
     let mut a = main_screen_app();
@@ -125,6 +76,35 @@ fn hit_rects_cover_the_focusable_controls() {
     }
     // the log rect is registered for the wheel
     assert!(a.log_rect.height > 0);
+}
+
+#[test]
+fn instructions_live_on_the_waiting_screen_only() {
+    let mut a = app();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+    // screen 1: the choice only, no connection instructions
+    terminal.draw(|f| render(f, &mut a)).unwrap();
+    let text = buffer_text(terminal.backend().buffer());
+    assert!(text.contains("Выберите колонку"));
+    assert!(!text.contains("Как подключить"));
+
+    // screen 2: the instructions of the chosen model
+    a.screen = Screen::Waiting;
+    a.hints = vec!["вставьте USB-кабель".into()];
+    terminal.draw(|f| render(f, &mut a)).unwrap();
+    let text = buffer_text(terminal.backend().buffer());
+    assert!(text.contains("подключения по USB"));
+    assert!(text.contains("вставьте USB-кабель"));
+}
+
+/// The buffer flattened into one string for `contains` checks.
+fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    buffer.content().iter().fold(String::new(), |mut acc, c| {
+        acc.push_str(c.symbol());
+        acc
+    })
 }
 
 #[test]

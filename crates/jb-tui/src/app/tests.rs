@@ -4,7 +4,7 @@ use super::*;
 use jb_core::backend::Backend;
 use jb_core::progress::Progress;
 use jb_core::scenario::Prepared;
-use jb_core::session::{Event, Identity, Model, Session};
+use jb_core::session::{Event, Identity, Model};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 
@@ -96,18 +96,19 @@ impl Backend for FakeBackend {
     }
 }
 
+fn fake_for_model(_: Model) -> Box<dyn Backend> {
+    Box::new(FakeBackend {
+        identity: Identity {
+            model: Model::Capsula,
+            key: "KEY".into(),
+            firstgen: false,
+            caveats: vec![],
+        },
+    })
+}
+
 fn app() -> App {
-    App::new(Session::spawn(
-        vec![Box::new(FakeBackend {
-            identity: Identity {
-                model: Model::Capsula,
-                key: "KEY".into(),
-                firstgen: false,
-                caveats: vec![],
-            },
-        })],
-        None,
-    ))
+    App::new(fake_for_model)
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -120,33 +121,55 @@ fn pump(app: &mut App, until: impl Fn(&App) -> bool) {
         if until(app) {
             return;
         }
-        match app.session.events().recv_timeout(Duration::from_secs(2)) {
-            Ok(ev) => app.on_session_event(ev),
+        let ev = match app
+            .session
+            .as_ref()
+            .expect("сессия не запущена")
+            .events()
+            .recv_timeout(Duration::from_secs(2))
+        {
+            Ok(ev) => ev,
             Err(_) => panic!("событие не пришло"),
-        }
+        };
+        app.on_session_event(ev);
     }
     panic!("условие не наступило");
 }
 
 #[test]
-fn screens_advance_and_model_switches_on_mismatch() {
+fn worker_spawns_at_the_model_commit_and_advances() {
     let mut a = app();
-    assert_eq!(a.screen, Screen::ModelSelect);
-    a.on_key(key(KeyCode::Tab)); // Model(1)
-    a.on_key(key(KeyCode::Enter)); // select Mini
-    assert_eq!(a.selected_model, Model::CapsulaMiniAmlogic);
-    a.on_key(key(KeyCode::Tab)); // ModelNext
-    a.on_key(key(KeyCode::Enter)); // -> Waiting
+    assert!(a.session.is_none()); // no worker behind the menu
+    a.activate(Focus::Model(0)); // commit -> spawn + Waiting
+    assert!(a.session.is_some());
     assert_eq!(a.screen, Screen::Waiting);
     pump(&mut a, |a| a.screen == Screen::Main);
-    // a Capsule connected while Mini was selected: switched
-    assert_eq!(a.identity.as_ref().unwrap().model, Model::Capsula);
-    assert_eq!(a.selected_model, Model::Capsula);
+    assert_eq!(a.identity.as_ref().unwrap().key, "KEY");
+}
+
+#[test]
+fn arrows_then_enter_choose_the_model_and_seed_the_hints() {
+    let mut a = app();
+    a.on_key(key(KeyCode::Down)); // cursor to the second row
+    a.on_key(key(KeyCode::Enter)); // choose -> spawn + Waiting
+    assert_eq!(a.selected_model, Model::CapsulaMiniAmlogic);
+    assert_eq!(a.screen, Screen::Waiting);
+    assert!(a.session.is_some());
+    assert_eq!(a.hints, vec![crate::hint_text(Model::CapsulaMiniAmlogic)]);
+}
+
+#[test]
+fn esc_on_waiting_quits_the_tool() {
+    let mut a = app();
+    a.activate(Focus::Model(0));
+    a.on_key(key(KeyCode::Esc));
+    assert!(a.quit);
 }
 
 #[test]
 fn flash_sends_jailbreak_and_confirm_modal_proceeds() {
     let mut a = app();
+    a.activate(Focus::Model(0)); // commit -> the worker starts
     pump(&mut a, |a| a.screen == Screen::Main);
     // focus starts on TakeBackup; walk to Flash
     for _ in 0..6 {
@@ -172,6 +195,7 @@ fn flash_sends_jailbreak_and_confirm_modal_proceeds() {
 #[test]
 fn confirm_abort_reaches_the_worker() {
     let mut a = app();
+    a.activate(Focus::Model(0)); // commit -> the worker starts
     pump(&mut a, |a| a.screen == Screen::Main);
     a.activate(Focus::Flash);
     pump(&mut a, |a| a.confirm.is_some());
@@ -184,6 +208,7 @@ fn confirm_abort_reaches_the_worker() {
 #[test]
 fn quit_is_blocked_while_busy() {
     let mut a = app();
+    a.activate(Focus::Model(0)); // commit -> the worker starts
     pump(&mut a, |a| a.screen == Screen::Main);
     a.activate(Focus::Flash);
     assert_ne!(a.busy, Busy::None);
@@ -199,6 +224,7 @@ fn ctrl_c_quits_when_idle_and_is_gated_while_busy() {
     assert!(a.quit);
 
     let mut a = app();
+    a.activate(Focus::Model(0)); // commit -> the worker starts
     pump(&mut a, |a| a.screen == Screen::Main);
     a.activate(Focus::Flash);
     a.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
