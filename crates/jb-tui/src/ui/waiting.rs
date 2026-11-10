@@ -11,11 +11,7 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
     let [hint, log] =
         Layout::vertical([Constraint::Length(14), Constraint::Min(3)]).areas(f.area());
 
-    let title = format!(
-        " Ждём {}: {} ",
-        app.selected_model.label(),
-        "подключения по USB"
-    );
+    let title = format!(" Ждём колонку: {} ", app.selected_model.label());
     f.render_widget(
         Paragraph::new(app.hints.join("\n\n"))
             .block(Block::default().borders(Borders::ALL).title(title))

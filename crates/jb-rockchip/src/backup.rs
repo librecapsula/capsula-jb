@@ -56,7 +56,7 @@ pub fn patch_read_limit<T: Transport>(
     let old = u32::from_le_bytes(cur);
     if old != total {
         progress(Progress::Step(format!(
-            "предел чтения: {old} → {total} секторов (RAM-патч usbplug)"
+            "расширяю предел чтения: {old} → {total} секторов"
         )));
         s.write_mem(addr, &total.to_le_bytes())?;
         let mut chk = [0u8; 4];
@@ -131,7 +131,9 @@ pub fn backup<T: Transport>(
     // read it separately. 4 sectors, far below the stock read mask —
     // works on both the usbplug and the stock loader (first
     // generation). Documentation-grade: nothing flashes it back.
-    progress(Progress::Step("idblock (LBA 0x40)".into()));
+    progress(Progress::Step(
+        "служебная таблица загрузки (idblock)".into(),
+    ));
     let mut idblock = vec![0u8; 4 * 512];
     s.read_lba(0x40, &mut idblock)?;
     std::fs::write(out_dir.join("idblock.bin"), &idblock)?;

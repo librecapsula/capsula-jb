@@ -61,7 +61,7 @@ pub fn build_image(
     }
     let device = if fresh {
         progress(Progress::Step(format!(
-            "userdata: чистый ext2 на {} байт (--format-userdata)",
+            "userdata: собираю с нуля (чистый ext2, {} байт)",
             part_size
         )));
         let device = FileBlockDevice::create(out, part_size)?;
@@ -69,9 +69,8 @@ pub fn build_image(
         FileBlockDevice::open(out)?
     } else {
         progress(Progress::Step(format!(
-            "userdata: копирую дамп {} → {}",
-            dump.display(),
-            out.display()
+            "userdata: беру за основу бэкап {}",
+            dump.display()
         )));
         std::fs::copy(dump, out)?;
         FileBlockDevice::open(out)?
@@ -84,10 +83,9 @@ pub fn build_image(
     for f in files {
         write_file(&fs, f).map_err(|e| no_space(e, &f.path))?;
         progress(Progress::Step(format!(
-            "userdata: {} ({} байт, права {:o})",
+            "userdata: добавляю {} ({} байт)",
             f.path,
-            f.data.len(),
-            f.mode
+            f.data.len()
         )));
     }
     let _ = fs.sync();

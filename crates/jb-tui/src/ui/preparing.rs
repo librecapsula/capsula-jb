@@ -15,13 +15,13 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 pub(super) fn render(f: &mut Frame, app: &mut App) {
     let [head, log] = Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).areas(f.area());
 
-    let title = format!(" Подготавливаем {}: … ", app.selected_model.label());
+    let title = format!(" Подготавливаем колонку: {} ", app.selected_model.label());
     let text = vec![
         Line::from(vec![
-            Span::styled("Устройство найдено", Style::default().fg(Color::Green)),
+            Span::styled("Колонка найдена", Style::default().fg(Color::Green)),
             Span::raw(" — поднимаю рабочий режим"),
         ]),
-        Line::from("загружаю лоадер в RAM / ставлю драйверы, это может занять полминуты"),
+        Line::from("загрузчик, драйверы — это может занять до полминуты"),
     ];
     f.render_widget(
         Paragraph::new(text)

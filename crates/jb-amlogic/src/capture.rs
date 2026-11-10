@@ -931,7 +931,9 @@ fn drive(
     // 1. Environment — once per capture, before the partitions (the
     // slot is taken from it).
     let env_text = if find_record(m, "env.txt").is_none() {
-        progress(Progress::Step("Amlogic: съём окружения u-boot".into()));
+        progress(Progress::Step(
+            "считываю окружение загрузчика (u-boot)".into(),
+        ));
         let env = dev
             .env()
             .map_err(|e| DriveError::Window(format!("съём окружения не удался (окно?): {e:#}")))?;
@@ -957,9 +959,7 @@ fn drive(
     let layout = if !m.layout.is_empty() {
         Layout::from_records(&m.layout, &m.reserved, m.nand_size)
     } else {
-        progress(Progress::Step(
-            "Amlogic: чтение таблицы разделов (DTB)".into(),
-        ));
+        progress(Progress::Step("читаю таблицу разделов".into()));
         let mut blob = None;
         let mut last = None;
         for slot in dtb_slots(env_text.as_deref()) {
@@ -998,7 +998,7 @@ fn drive(
             .collect();
         save_manifest(dir, m).map_err(DriveError::Fatal)?;
         progress(Progress::Step(format!(
-            "Amlogic: разметка из DTB {slot}: {} разделов",
+            "таблица разделов ({slot}): {} разделов",
             layout.partitions.len()
         )));
         layout
@@ -1025,7 +1025,7 @@ fn drive(
         };
         if expected < *size as u64 {
             progress(Progress::Step(format!(
-                "Amlogic: {name} логический размер {expected:#x}, физический {size:#x} \
+                "{name}: логический размер {expected:#x}, физический {size:#x} \
                  (бед-блоки исключены)"
             )));
         }
@@ -1049,9 +1049,7 @@ fn drive(
     //    back).
     for (name, off, size) in &layout.reserved {
         let base = format!("reserved-{name}.bin");
-        progress(Progress::Step(format!(
-            "Amlogic: зарезервированная область {name}"
-        )));
+        progress(Progress::Step(format!("зарезервированная область {name}")));
         capture_item(
             dev,
             dir,

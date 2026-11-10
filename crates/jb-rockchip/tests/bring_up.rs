@@ -480,5 +480,8 @@ fn wrong_dram_signatures_fail_the_bring_up() {
         Ok(_) => panic!("wrong signatures — bring_up must fail"),
         Err(e) => e,
     };
-    assert!(err.to_string().contains("сигнатуры"), "{err}");
+    assert!(
+        err.to_string().contains("проверка загрузчика не сошлась"),
+        "{err}"
+    );
 }

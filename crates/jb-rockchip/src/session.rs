@@ -240,7 +240,7 @@ pub fn bring_up<B: Bus>(
                     let why = if firstgen {
                         "первое поколение"
                     } else {
-                        "без выгрузки usbplug"
+                        "без полного бэкапа"
                     };
                     let session = attach_stock_loader(bus, progress, why)?;
                     return Ok(BroughtUp {
@@ -357,11 +357,13 @@ fn load_usbplug<B: Bus>(
     loader: &LoaderContainer,
     progress: ProgressFn,
 ) -> Result<LoaderSession<B::T>, BringUpError> {
-    progress(Progress::Step("лоадер (330d): сбрасываю в MaskROM".into()));
+    progress(Progress::Step(
+        "штатный загрузчик: перезапускаю колонку в MaskROM".into(),
+    ));
     let mut s = bus.open_loader()?;
     if let Err(e) = s.ready() {
         return Err(UsbError::WrongMode(format!(
-            "лоадер (330d) не отвечает ({e}): передёрните \
+            "штатный загрузчик не отвечает ({e}): передёрните \
              питание и войдите в режим лоадера заново"
         ))
         .into());
@@ -407,21 +409,23 @@ fn download_usbplug<B: Bus>(
     progress: ProgressFn,
 ) -> Result<LoaderSession<B::T>, BringUpError> {
     progress(Progress::Step(
-        "MaskROM: загружаю лоадер в RAM (флеш не трогаю)".into(),
+        "MaskROM: загружаю служебный загрузчик в память (флеш не трогаю)".into(),
     ));
     {
         let mut m = MaskRomSession::new(bus.open_maskrom()?);
         m.download(loader).map_err(|_| {
-            progress(Progress::Step("лоадер отвергнут на передаче".into()));
+            progress(Progress::Step(
+                "колонка отвергла загрузчик при передаче".into(),
+            ));
             BringUpError::LoaderRejected
         })?;
     }
-    progress(Progress::Step("жду usbplug (до 10 с)".into()));
+    progress(Progress::Step("жду служебный загрузчик (до 10 с)".into()));
     if bus
         .wait_mode(rockusb::DeviceMode::UsbPlug, USBPLUG_WAIT)
         .is_err()
     {
-        progress(Progress::Step("usbplug не поднялся".into()));
+        progress(Progress::Step("служебный загрузчик не запустился".into()));
         return Err(BringUpError::LoaderRejected);
     }
     let mut s = bus.open_loader()?;
@@ -440,12 +444,12 @@ fn attach_stock_loader<B: Bus>(
     why: &str,
 ) -> rockusb::Result<LoaderSession<B::T>> {
     progress(Progress::Step(format!(
-        "{why}: работаю через стоковый лоадер (330d)"
+        "{why}: работаю через штатный загрузчик колонки"
     )));
     let mut s = bus.open_loader()?;
     if let Err(e) = s.ready() {
         return Err(UsbError::WrongMode(format!(
-            "стоковый лоадер (330d) не отвечает ({e}): передёрните питание \
+            "штатный загрузчик не отвечает ({e}): передёрните питание \
              и войдите в режим лоадера заново"
         )));
     }
@@ -471,14 +475,14 @@ fn verify_usbplug_signatures<T: Transport>(
         s.read_mem(addr, &mut buf[..want.len()])?;
         if &buf[..want.len()] != want.as_slice() {
             progress(Progress::Step(format!(
-                "usbplug не совпал: {which} по адресу {addr:#x}"
+                "проверка загрузчика не сошлась: {which} по адресу {addr:#x}"
             )));
             return Err(UsbError::WrongMode(
-                "сигнатуры usbplug не совпали (чужой лоадер?)".into(),
+                "проверка загрузчика не сошлась (чужой загрузчик?)".into(),
             ));
         }
     }
-    progress(Progress::Step("сигнатуры usbplug сверены".into()));
+    progress(Progress::Step("служебный загрузчик проверен".into()));
     Ok(())
 }
 
@@ -489,7 +493,7 @@ pub fn read_gpt<T: Transport>(
     s: &mut LoaderSession<T>,
     progress: ProgressFn,
 ) -> rockusb::Result<(crate::gpt::Gpt, Vec<u8>)> {
-    progress(Progress::Step("читаю GPT".into()));
+    progress(Progress::Step("читаю таблицу разделов".into()));
     let mut buf = vec![0u8; 34 * 512];
     s.read_lba(1, &mut buf)?;
     let gpt = crate::gpt::Gpt::parse(&buf).map_err(|e| UsbError::Loader(format!("GPT: {e}")))?;
